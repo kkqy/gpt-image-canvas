@@ -241,6 +241,14 @@ interface ActiveGenerationTask {
   serverGenerationId?: string;
 }
 
+interface CanvasImageLayoutItem {
+  shape: TLImageShape;
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+}
+
 interface StorageConfigFormState {
   enabled: boolean;
   secretId: string;
@@ -628,6 +636,10 @@ function isGenerationPlaceholderShape(shape: unknown): shape is GenerationPlaceh
   return isRecord(shape) && shape.type === GENERATION_PLACEHOLDER_TYPE;
 }
 
+function isImageShape(shape: unknown): shape is TLImageShape {
+  return isRecord(shape) && shape.type === "image";
+}
+
 function livePlacement(editor: Editor, placement: GenerationPlaceholderPlacement): GenerationPlaceholderPlacement {
   const shape = editor.getShape(placement.id);
   if (!isGenerationPlaceholderShape(shape)) {
@@ -875,6 +887,116 @@ function placeholderSetForGeneration(editor: Editor, generationId: string, reque
     }));
 
   return placements.length > 0 ? { requestId, placements } : undefined;
+}
+
+function failedGenerationPlaceholderIds(editor: Editor): TLShapeId[] {
+  return editor
+    .getCurrentPageShapes()
+    .filter(isGenerationPlaceholderShape)
+    .filter((shape) => shape.props.status === "failed")
+    .map((shape) => shape.id);
+}
+
+function selectedOrAllCanvasImageShapes(editor: Editor): TLImageShape[] {
+  const selectedImageShapes = editor.getSelectedShapes().filter(isImageShape);
+  return selectedImageShapes.length > 0 ? selectedImageShapes : editor.getCurrentPageShapes().filter(isImageShape);
+}
+
+function canvasImageLayoutItems(editor: Editor, imageShapes: TLImageShape[]): CanvasImageLayoutItem[] {
+  return imageShapes
+    .flatMap((shape) => {
+      const bounds = editor.getShapePageBounds(shape.id);
+      if (!bounds) {
+        return [];
+      }
+
+      return [
+        {
+          shape,
+          width: bounds.w,
+          height: bounds.h,
+          x: bounds.x,
+          y: bounds.y
+        }
+      ];
+    })
+    .sort((left, right) => left.y - right.y || left.x - right.x);
+}
+
+function matrixScoreForCanvasImages(items: CanvasImageLayoutItem[], columns: number, gap: number): number {
+  const rows = Math.ceil(items.length / columns);
+  const columnWidths = Array.from({ length: columns }, (_, column) =>
+    Math.max(...items.filter((_, index) => index % columns === column).map((item) => item.width), 0)
+  );
+  const rowHeights = Array.from({ length: rows }, (_, row) =>
+    Math.max(...items.filter((_, index) => Math.floor(index / columns) === row).map((item) => item.height), 0)
+  );
+  const gridWidth = columnWidths.reduce((total, value) => total + value, 0) + Math.max(0, columns - 1) * gap;
+  const gridHeight = rowHeights.reduce((total, value) => total + value, 0) + Math.max(0, rows - 1) * gap;
+
+  if (gridWidth <= 0 || gridHeight <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.abs(Math.log(gridWidth / gridHeight));
+}
+
+function bestCanvasImageColumnCount(items: CanvasImageLayoutItem[], gap: number): number {
+  let bestColumns = 1;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (let columns = 1; columns <= items.length; columns += 1) {
+    const score = matrixScoreForCanvasImages(items, columns, gap);
+    if (score < bestScore) {
+      bestColumns = columns;
+      bestScore = score;
+    }
+  }
+
+  return bestColumns;
+}
+
+function arrangeCanvasImageShapes(editor: Editor, imageShapes: TLImageShape[]): number {
+  const items = canvasImageLayoutItems(editor, imageShapes);
+  if (items.length === 0) {
+    return 0;
+  }
+
+  const gap = 48;
+  const columns = bestCanvasImageColumnCount(items, gap);
+  const rows = Math.ceil(items.length / columns);
+  const columnWidths = Array.from({ length: columns }, (_, column) =>
+    Math.max(...items.filter((_, index) => index % columns === column).map((item) => item.width), 0)
+  );
+  const rowHeights = Array.from({ length: rows }, (_, row) =>
+    Math.max(...items.filter((_, index) => Math.floor(index / columns) === row).map((item) => item.height), 0)
+  );
+  const gridWidth = columnWidths.reduce((total, value) => total + value, 0) + Math.max(0, columns - 1) * gap;
+  const gridHeight = rowHeights.reduce((total, value) => total + value, 0) + Math.max(0, rows - 1) * gap;
+  const boundsLeft = Math.min(...items.map((item) => item.x));
+  const boundsTop = Math.min(...items.map((item) => item.y));
+  const boundsRight = Math.max(...items.map((item) => item.x + item.width));
+  const boundsBottom = Math.max(...items.map((item) => item.y + item.height));
+  const originX = (boundsLeft + boundsRight) / 2 - gridWidth / 2;
+  const originY = (boundsTop + boundsBottom) / 2 - gridHeight / 2;
+  const columnOffsets = columnWidths.map((_, column) => columnWidths.slice(0, column).reduce((total, value) => total + value, 0) + column * gap);
+  const rowOffsets = rowHeights.map((_, row) => rowHeights.slice(0, row).reduce((total, value) => total + value, 0) + row * gap);
+
+  editor.updateShapes<TLImageShape>(
+    items.map((item, index) => {
+      const column = index % columns;
+      const row = Math.floor(index / columns);
+      return {
+        id: item.shape.id,
+        type: "image",
+        x: originX + columnOffsets[column] + (columnWidths[column] - item.width) / 2,
+        y: originY + rowOffsets[row] + (rowHeights[row] - item.height) / 2
+      } satisfies TLShapePartial<TLImageShape>;
+    })
+  );
+
+  editor.select(...items.map((item) => item.shape.id));
+  return items.length;
 }
 
 function resolveReferenceSelection(editor: Editor, t: Translate): ReferenceSelection {
@@ -2931,6 +3053,47 @@ export function App() {
     setGenerationMessage(t("generationLocateSucceeded"));
   }
 
+  function cleanFailedCanvasGenerations(): void {
+    setGenerationError("");
+    setGenerationMessage("");
+    setGenerationWarning("");
+
+    const editor = editorRef.current;
+    if (!editor) {
+      setGenerationError(t("generationCanvasNotReady"));
+      return;
+    }
+
+    const failedPlaceholderIds = failedGenerationPlaceholderIds(editor);
+    if (failedPlaceholderIds.length === 0) {
+      setGenerationMessage(t("canvasCleanupNoFailed"));
+      return;
+    }
+
+    editor.deleteShapes(failedPlaceholderIds);
+    setGenerationMessage(t("canvasCleanupSucceeded", { count: failedPlaceholderIds.length }));
+  }
+
+  function arrangeSelectedOrAllCanvasImages(): void {
+    setGenerationError("");
+    setGenerationMessage("");
+    setGenerationWarning("");
+
+    const editor = editorRef.current;
+    if (!editor) {
+      setGenerationError(t("generationCanvasNotReady"));
+      return;
+    }
+
+    const arrangedCount = arrangeCanvasImageShapes(editor, selectedOrAllCanvasImageShapes(editor));
+    if (arrangedCount === 0) {
+      setGenerationMessage(t("canvasArrangeNoImages"));
+      return;
+    }
+
+    setGenerationMessage(t("canvasArrangeSucceeded", { count: arrangedCount }));
+  }
+
   async function rerunHistoryRecord(record: GenerationRecord): Promise<void> {
     const nextPresetId = coerceStylePresetId(record.presetId);
     const nextSizePresetId = sizePresetIdForSize(record.size.width, record.size.height);
@@ -3167,6 +3330,16 @@ export function App() {
             </div>
           </div>
         )}
+        <div className="canvas-quick-actions" aria-label={t("canvasQuickActionsAria")} data-testid="canvas-quick-actions">
+          <button className="canvas-quick-actions__button" type="button" onClick={cleanFailedCanvasGenerations}>
+            <XCircle className="size-4" aria-hidden="true" />
+            {t("canvasCleanupFailed")}
+          </button>
+          <button className="canvas-quick-actions__button" type="button" onClick={arrangeSelectedOrAllCanvasImages}>
+            <Square className="size-4" aria-hidden="true" />
+            {t("canvasArrangeImages")}
+          </button>
+        </div>
       </section>
 
       {isMobileDrawer && isAiPanelOpen ? (
