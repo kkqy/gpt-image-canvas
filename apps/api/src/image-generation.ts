@@ -84,22 +84,9 @@ const mimeTypes: Record<OutputFormat, string> = {
 };
 
 export async function runTextToImageGeneration(input: ImageProviderInput, provider: ImageProvider, signal?: AbortSignal): Promise<GenerationResponse> {
-  const outputs = await mapWithConcurrency(
-    Array.from({ length: input.count }, (_, index) => index),
-    getBatchConcurrency(),
-    async () => generateSingleOutput(input, provider, signal)
-  );
-
-  const record = saveGenerationRecord(
-    {
-      ...input,
-      mode: "generate"
-    },
-    outputs
-  );
-
+  const record = createRunningTextGenerationRecord(input);
   return {
-    record
+    record: await completeTextGenerationRecord(record.id, input, provider, signal)
   };
 }
 
@@ -108,6 +95,23 @@ export async function runReferenceImageGeneration(
   provider: ImageProvider,
   signal?: AbortSignal
 ): Promise<GenerationResponse> {
+  const started = await createRunningReferenceGenerationRecord(input);
+  return {
+    record: await completeReferenceGenerationRecord(started.record.id, started.input, provider, signal)
+  };
+}
+
+export function createRunningTextGenerationRecord(input: ImageProviderInput): GenerationRecord {
+  return createRunningGenerationRecord({
+    ...input,
+    mode: "generate"
+  });
+}
+
+export async function createRunningReferenceGenerationRecord(input: EditImageProviderInput): Promise<{
+  record: GenerationRecord;
+  input: EditImageProviderInput;
+}> {
   const referenceAssetIds = await ensureReferenceAssetIds(input);
   const inputWithReferenceAssets: EditImageProviderInput = {
     ...input,
@@ -115,23 +119,67 @@ export async function runReferenceImageGeneration(
     referenceAssetId: referenceAssetIds[0]
   };
 
-  const outputs = await mapWithConcurrency(
-    Array.from({ length: inputWithReferenceAssets.count }, (_, index) => index),
-    getBatchConcurrency(),
-    async () => editSingleOutput(inputWithReferenceAssets, provider, signal)
-  );
-
-  const record = saveGenerationRecord(
-    {
+  return {
+    record: createRunningGenerationRecord({
       ...inputWithReferenceAssets,
       mode: "edit"
-    },
-    outputs
+    }),
+    input: inputWithReferenceAssets
+  };
+}
+
+export async function completeTextGenerationRecord(
+  generationId: string,
+  input: ImageProviderInput,
+  provider: ImageProvider,
+  signal?: AbortSignal
+): Promise<GenerationRecord> {
+  const outputs = await mapWithConcurrency(
+    Array.from({ length: input.count }, (_, index) => index),
+    getBatchConcurrency(),
+    async () => generateSingleOutput(input, provider, signal)
   );
 
-  return {
-    record
-  };
+  return completeGenerationRecord(generationId, { ...input, mode: "generate" }, outputs);
+}
+
+export async function completeReferenceGenerationRecord(
+  generationId: string,
+  input: EditImageProviderInput,
+  provider: ImageProvider,
+  signal?: AbortSignal
+): Promise<GenerationRecord> {
+  const outputs = await mapWithConcurrency(
+    Array.from({ length: input.count }, (_, index) => index),
+    getBatchConcurrency(),
+    async () => editSingleOutput(input, provider, signal)
+  );
+
+  return completeGenerationRecord(generationId, { ...input, mode: "edit" }, outputs);
+}
+
+export function markGenerationRecordCancelled(generationId: string, message: string): void {
+  db.update(generationRecords)
+    .set({
+      status: "cancelled",
+      error: sanitizeGenerationErrorMessage(message)
+    })
+    .where(eq(generationRecords.id, generationId))
+    .run();
+}
+
+export function markGenerationRecordFailed(generationId: string, message: string): void {
+  db.update(generationRecords)
+    .set({
+      status: "failed",
+      error: sanitizeGenerationErrorMessage(message)
+    })
+    .where(eq(generationRecords.id, generationId))
+    .run();
+}
+
+export function isGenerationAbortError(error: unknown): boolean {
+  return isAbortError(error);
 }
 
 async function ensureReferenceAssetIds(input: EditImageProviderInput): Promise<string[]> {
@@ -400,14 +448,9 @@ async function readImageSize(bytes: Buffer): Promise<ImageSize | undefined> {
   }
 }
 
-function saveGenerationRecord(input: PersistedGenerationInput, outputs: BatchOutputResult[]): GenerationRecord {
+function createRunningGenerationRecord(input: PersistedGenerationInput): GenerationRecord {
   const createdAt = new Date().toISOString();
-  const generationId = randomUUID();
-  const successCount = outputs.filter((output) => output.status === "succeeded").length;
-  const failureCount = outputs.length - successCount;
-  const status = resolveGenerationStatus(successCount, failureCount);
-  const error = failureCount > 0 ? `${failureCount} 张图像生成失败。` : undefined;
-
+  const generationId = input.generationId ?? randomUUID();
   const referenceAssetIds = input.referenceAssetIds ?? (input.referenceAssetId ? [input.referenceAssetId] : []);
   const primaryReferenceAssetId = referenceAssetIds[0] ?? input.referenceAssetId;
 
@@ -423,8 +466,8 @@ function saveGenerationRecord(input: PersistedGenerationInput, outputs: BatchOut
       quality: input.quality,
       outputFormat: input.outputFormat,
       count: input.count,
-      status,
-      error,
+      status: "running",
+      error: null,
       referenceAssetId: primaryReferenceAssetId ?? null,
       createdAt
     })
@@ -440,6 +483,39 @@ function saveGenerationRecord(input: PersistedGenerationInput, outputs: BatchOut
       })
       .run();
   });
+
+  return generationRecordFromInput(generationId, input, {
+    createdAt,
+    error: undefined,
+    outputs: [],
+    status: "running"
+  });
+}
+
+function completeGenerationRecord(generationId: string, input: PersistedGenerationInput, outputs: BatchOutputResult[]): GenerationRecord {
+  const recordRow = db.select().from(generationRecords).where(eq(generationRecords.id, generationId)).get();
+  const createdAt = recordRow?.createdAt ?? new Date().toISOString();
+  if (recordRow?.status === "cancelled") {
+    return generationRecordFromInput(generationId, input, {
+      createdAt,
+      error: recordRow.error ?? undefined,
+      outputs: [],
+      status: "cancelled"
+    });
+  }
+
+  const successCount = outputs.filter((output) => output.status === "succeeded").length;
+  const failureCount = outputs.length - successCount;
+  const status = resolveGenerationStatus(successCount, failureCount);
+  const error = failureCount > 0 ? `${failureCount} 张图像生成失败。` : undefined;
+
+  db.update(generationRecords)
+    .set({
+      status,
+      error: error ?? null
+    })
+    .where(eq(generationRecords.id, generationId))
+    .run();
 
   for (const output of outputs) {
     if (output.asset) {
@@ -460,7 +536,7 @@ function saveGenerationRecord(input: PersistedGenerationInput, outputs: BatchOut
           cloudUploadedAt: output.cloudStorage?.uploadedAt ?? null,
           cloudEtag: output.cloudStorage?.etag ?? null,
           cloudRequestId: output.cloudStorage?.requestId ?? null,
-          createdAt
+          createdAt: new Date().toISOString()
         })
         .run();
     }
@@ -472,10 +548,31 @@ function saveGenerationRecord(input: PersistedGenerationInput, outputs: BatchOut
         status: output.status,
         assetId: output.asset?.id ?? null,
         error: output.error ?? null,
-        createdAt
+        createdAt: new Date().toISOString()
       })
       .run();
   }
+
+  return generationRecordFromInput(generationId, input, {
+    createdAt,
+    error,
+    outputs: outputs.map(toGenerationOutput),
+    status,
+  });
+}
+
+function generationRecordFromInput(
+  generationId: string,
+  input: PersistedGenerationInput,
+  state: {
+    createdAt: string;
+    error?: string;
+    outputs: GenerationOutput[];
+    status: GenerationStatus;
+  }
+): GenerationRecord {
+  const referenceAssetIds = input.referenceAssetIds ?? (input.referenceAssetId ? [input.referenceAssetId] : []);
+  const primaryReferenceAssetId = referenceAssetIds[0] ?? input.referenceAssetId;
 
   return {
     id: generationId,
@@ -487,12 +584,12 @@ function saveGenerationRecord(input: PersistedGenerationInput, outputs: BatchOut
     quality: input.quality,
     outputFormat: input.outputFormat,
     count: input.count,
-    status,
-    error,
+    status: state.status,
+    error: state.error,
     referenceAssetIds: referenceAssetIds.length > 0 ? referenceAssetIds : undefined,
     referenceAssetId: primaryReferenceAssetId,
-    createdAt,
-    outputs: outputs.map(toGenerationOutput)
+    createdAt: state.createdAt,
+    outputs: state.outputs
   };
 }
 

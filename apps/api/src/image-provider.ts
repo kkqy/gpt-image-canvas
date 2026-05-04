@@ -9,6 +9,7 @@ import {
 } from "./contracts.js";
 
 export interface ImageProviderInput {
+  generationId?: string;
   originalPrompt: string;
   presetId: string;
   prompt: string;

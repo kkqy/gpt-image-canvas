@@ -226,6 +226,7 @@ export interface ReferenceImageInput {
 export const MAX_REFERENCE_IMAGES = 3;
 
 export interface GenerateImageRequest {
+  generationId?: string;
   prompt: string;
   presetId: StylePresetId;
   size: ImageSize;

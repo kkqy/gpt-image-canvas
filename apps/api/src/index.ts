@@ -43,17 +43,24 @@ import {
 } from "./image-provider.js";
 import { createConfiguredImageProvider } from "./image-provider-selection.js";
 import {
+  completeReferenceGenerationRecord,
+  completeTextGenerationRecord,
+  createRunningReferenceGenerationRecord,
+  createRunningTextGenerationRecord,
   getStoredAssetFile,
+  isGenerationAbortError,
+  markGenerationRecordCancelled,
+  markGenerationRecordFailed,
   readStoredAsset,
-  readStoredAssetMetadata,
-  runReferenceImageGeneration,
-  runTextToImageGeneration
+  readStoredAssetMetadata
 } from "./image-generation.js";
 import {
   deleteGalleryOutput,
   getAssetPromptMetadata,
   getGalleryImages,
+  getGenerationRecord,
   getProjectState,
+  markStaleRunningGenerationsFailed,
   saveProjectSnapshot,
   type AssetPromptMetadata
 } from "./project-store.js";
@@ -78,7 +85,14 @@ interface PromptMetadataDownloadInput {
   promptMetadata?: AssetPromptMetadata;
 }
 
+interface ServerGenerationTask {
+  controller: AbortController;
+}
+
 export const app = new Hono();
+const serverGenerationTasks = new Map<string, ServerGenerationTask>();
+
+markStaleRunningGenerationsFailed("服务已重启，生成任务中断。");
 
 app.onError((error, c) => {
   console.error(error);
@@ -319,8 +333,9 @@ app.post("/api/images/generate", async (c) => {
   }
 
   try {
-    const provider = await createConfiguredImageProvider(c.req.raw.signal);
-    return c.json(await runTextToImageGeneration(parsed.value, provider, c.req.raw.signal));
+    const record = createRunningTextGenerationRecord(parsed.value);
+    startTextGenerationTask(record.id, parsed.value);
+    return c.json({ record });
   } catch (error) {
     if (error instanceof ProviderError) {
       return providerErrorJson(c, error);
@@ -342,8 +357,9 @@ app.post("/api/images/edit", async (c) => {
   }
 
   try {
-    const provider = await createConfiguredImageProvider(c.req.raw.signal);
-    return c.json(await runReferenceImageGeneration(parsed.value, provider, c.req.raw.signal));
+    const started = await createRunningReferenceGenerationRecord(parsed.value);
+    startReferenceGenerationTask(started.record.id, started.input);
+    return c.json({ record: started.record });
   } catch (error) {
     if (error instanceof ProviderError) {
       return providerErrorJson(c, error);
@@ -351,6 +367,40 @@ app.post("/api/images/edit", async (c) => {
 
     throw error;
   }
+});
+
+app.get("/api/generations/:id", (c) => {
+  const record = getGenerationRecord(c.req.param("id"));
+  if (!record) {
+    return c.json(errorResponse("not_found", "找不到请求的生成记录。"), 404);
+  }
+
+  return c.json({ record });
+});
+
+app.post("/api/generations/:id/cancel", (c) => {
+  const generationId = c.req.param("id");
+  const existingRecord = getGenerationRecord(generationId);
+  if (!existingRecord) {
+    return c.json(errorResponse("not_found", "找不到请求的生成记录。"), 404);
+  }
+  if (existingRecord.status !== "running" && existingRecord.status !== "pending") {
+    return c.json({ record: existingRecord });
+  }
+
+  const task = serverGenerationTasks.get(generationId);
+  if (task) {
+    task.controller.abort();
+    serverGenerationTasks.delete(generationId);
+  }
+
+  markGenerationRecordCancelled(generationId, "已取消本次生成。");
+  const record = getGenerationRecord(generationId);
+  if (!record) {
+    return c.json(errorResponse("not_found", "找不到请求的生成记录。"), 404);
+  }
+
+  return c.json({ record });
 });
 
 const webDistRoot = relative(process.cwd(), runtimePaths.webDistDir) || ".";
@@ -380,6 +430,38 @@ function errorResponse(code: string, message: string): ErrorResponseBody {
 
 function downloadFileName(fileName: string): string {
   return fileName.replace(/[^a-zA-Z0-9._-]/gu, "_");
+}
+
+function startTextGenerationTask(generationId: string, input: ImageProviderInput): void {
+  startGenerationTask(generationId, async (signal) => {
+    const provider = await createConfiguredImageProvider(signal);
+    await completeTextGenerationRecord(generationId, input, provider, signal);
+  });
+}
+
+function startReferenceGenerationTask(generationId: string, input: EditImageProviderInput): void {
+  startGenerationTask(generationId, async (signal) => {
+    const provider = await createConfiguredImageProvider(signal);
+    await completeReferenceGenerationRecord(generationId, input, provider, signal);
+  });
+}
+
+function startGenerationTask(generationId: string, run: (signal: AbortSignal) => Promise<void>): void {
+  const controller = new AbortController();
+  serverGenerationTasks.set(generationId, { controller });
+
+  void run(controller.signal)
+    .catch((error) => {
+      if (isGenerationAbortError(error) || controller.signal.aborted) {
+        markGenerationRecordCancelled(generationId, "已取消本次生成。");
+        return;
+      }
+
+      markGenerationRecordFailed(generationId, errorToMessage(error));
+    })
+    .finally(() => {
+      serverGenerationTasks.delete(generationId);
+    });
 }
 
 async function embedPromptMetadataForDownload(input: PromptMetadataDownloadInput): Promise<Buffer> {
@@ -910,6 +992,7 @@ function parseBaseImagePayload(input: unknown): ParseResult<ImageProviderInput> 
   return {
     ok: true,
     value: {
+      generationId: parseGenerationId(input.generationId),
       originalPrompt: prompt.trim(),
       presetId: stylePreset.value,
       prompt: composePrompt(prompt, stylePreset.value),
@@ -920,6 +1003,15 @@ function parseBaseImagePayload(input: unknown): ParseResult<ImageProviderInput> 
       count: count.value
     }
   };
+}
+
+function parseGenerationId(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  return /^[a-zA-Z0-9_-]{8,80}$/u.test(trimmed) ? trimmed : undefined;
 }
 
 function parseStylePreset(input: Record<string, unknown>): ParseResult<StylePresetId> {

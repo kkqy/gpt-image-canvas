@@ -228,7 +228,7 @@ interface GenerationPlaceholderPlacement {
 }
 
 interface ActiveGenerationPlaceholders {
-  requestId: number;
+  requestId: number | string;
   placements: GenerationPlaceholderPlacement[];
 }
 
@@ -237,6 +237,8 @@ interface ActiveGenerationTask {
   temporaryRecordId: string;
   controller: AbortController;
   placeholderSet: ActiveGenerationPlaceholders;
+  pollTimer?: number;
+  serverGenerationId?: string;
 }
 
 interface StorageConfigFormState {
@@ -391,6 +393,10 @@ function generationFailureMessage(record: GenerationRecord, t: Translate): strin
   return summary || t("generationNoSuccessfulImage");
 }
 
+function isPendingGenerationRecord(record: GenerationRecord): boolean {
+  return record.status === "running" || record.status === "pending";
+}
+
 function generationWarningMessage(record: GenerationRecord, insertedCount: number, failedCount: number, cloudFailedCount: number, t: Translate): string {
   const parts = [t("generationImageInsertedPart", { count: insertedCount })];
   if (failedCount > 0) {
@@ -409,48 +415,6 @@ function generationWarningMessage(record: GenerationRecord, insertedCount: numbe
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isLoadingGenerationPlaceholderRecord(value: unknown): boolean {
-  return (
-    isRecord(value) &&
-    value.typeName === "shape" &&
-    value.type === GENERATION_PLACEHOLDER_TYPE &&
-    isRecord(value.props) &&
-    value.props.status === "loading"
-  );
-}
-
-function filterLoadingPlaceholdersFromStoreSnapshot<TSnapshot>(snapshot: TSnapshot): TSnapshot {
-  if (!isRecord(snapshot) || !isRecord(snapshot.store)) {
-    return snapshot;
-  }
-
-  let removed = false;
-  const nextStore: Record<string, unknown> = {};
-  for (const [id, record] of Object.entries(snapshot.store)) {
-    if (isLoadingGenerationPlaceholderRecord(record)) {
-      removed = true;
-      continue;
-    }
-
-    nextStore[id] = record;
-  }
-
-  return removed ? ({ ...snapshot, store: nextStore } as TSnapshot) : snapshot;
-}
-
-function filterLoadingPlaceholdersFromSnapshot<TSnapshot>(snapshot: TSnapshot): TSnapshot {
-  if (!isRecord(snapshot)) {
-    return snapshot;
-  }
-
-  if (isRecord(snapshot.document)) {
-    const document = filterLoadingPlaceholdersFromStoreSnapshot(snapshot.document);
-    return document === snapshot.document ? snapshot : ({ ...snapshot, document } as TSnapshot);
-  }
-
-  return filterLoadingPlaceholdersFromStoreSnapshot(snapshot);
 }
 
 function coerceStylePresetId(value: string): StylePresetId {
@@ -504,6 +468,7 @@ function referenceAssetIdsForSelection(selection: Extract<ReferenceSelection, { 
 
 function createTemporaryGenerationRecord(input: {
   requestId: number;
+  generationId?: string;
   submitInput: GenerationSubmitInput;
   requestMode: GenerationMode;
   referenceAssetIds?: string[];
@@ -513,7 +478,7 @@ function createTemporaryGenerationRecord(input: {
   const referenceAssetIds = input.referenceAssetIds ?? (input.referenceAssetId ? [input.referenceAssetId] : undefined);
 
   return {
-    id: `local-generation-${input.requestId}`,
+    id: input.generationId ?? `local-generation-${input.requestId}`,
     mode: generationModeToRecordMode(input.requestMode),
     prompt: promptValue,
     effectivePrompt: promptValue,
@@ -624,7 +589,7 @@ function createCenteredPlacements(editor: Editor, countValue: GenerationCount, s
 function createGenerationPlaceholders(
   editor: Editor,
   input: GenerationSubmitInput,
-  requestId: number,
+  requestId: number | string,
   options: { selectPlaceholders?: boolean } = {}
 ): ActiveGenerationPlaceholders {
   const placements = createCenteredPlacements(editor, input.count, input.size);
@@ -871,6 +836,45 @@ function deleteLoadingGenerationPlaceholders(editor: Editor, placeholderSet: Act
 
 function firstLiveGenerationPlaceholder(editor: Editor, placeholderSet: ActiveGenerationPlaceholders): TLShapeId | undefined {
   return placeholderSet.placements.find((placement) => isGenerationPlaceholderShape(editor.getShape(placement.id)))?.id;
+}
+
+function updateGenerationPlaceholderRequestId(editor: Editor, placeholderSet: ActiveGenerationPlaceholders, generationId: string): void {
+  const updates = placeholderSet.placements.flatMap((placement) =>
+    isGenerationPlaceholderShape(editor.getShape(placement.id))
+      ? [
+          {
+            id: placement.id,
+            type: GENERATION_PLACEHOLDER_TYPE,
+            props: {
+              requestId: generationId
+            }
+          } satisfies TLShapePartial<GenerationPlaceholderShape>
+        ]
+      : []
+  );
+
+  if (updates.length > 0) {
+    editor.updateShapes<GenerationPlaceholderShape>(updates);
+  }
+}
+
+function placeholderSetForGeneration(editor: Editor, generationId: string, requestId: number): ActiveGenerationPlaceholders | undefined {
+  const placements = editor
+    .getCurrentPageShapes()
+    .filter(isGenerationPlaceholderShape)
+    .filter((shape) => shape.props.requestId === generationId)
+    .sort((left, right) => left.props.outputIndex - right.props.outputIndex)
+    .map((shape) => ({
+      id: shape.id,
+      x: shape.x,
+      y: shape.y,
+      width: shape.props.w,
+      height: shape.props.h,
+      targetWidth: shape.props.targetWidth,
+      targetHeight: shape.props.targetHeight
+    }));
+
+  return placements.length > 0 ? { requestId, placements } : undefined;
 }
 
 function resolveReferenceSelection(editor: Editor, t: Translate): ReferenceSelection {
@@ -1825,6 +1829,7 @@ export function App() {
   const [quality, setQuality] = useState<ImageQuality>("auto");
   const [outputFormat, setOutputFormat] = useState<OutputFormat>("png");
   const [activeGenerationCount, setActiveGenerationCount] = useState(0);
+  const [editorMountVersion, setEditorMountVersion] = useState(0);
   const [isProjectLoaded, setIsProjectLoaded] = useState(false);
   const [projectSnapshot, setProjectSnapshot] = useState<PersistedSnapshot | undefined>();
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("loading");
@@ -1859,6 +1864,7 @@ export function App() {
   const editorRef = useRef<Editor | null>(null);
   const generationModeRef = useRef<GenerationMode>("text");
   const activeGenerationsRef = useRef<Map<number, ActiveGenerationTask>>(new Map());
+  const restoredGenerationIdsRef = useRef<Set<string>>(new Set());
   const generationRequestRef = useRef(0);
   const saveTimerRef = useRef<number | undefined>();
   const codexPollTimerRef = useRef<number | undefined>();
@@ -2006,6 +2012,7 @@ export function App() {
   useEffect(() => {
     return () => {
       for (const task of activeGenerationsRef.current.values()) {
+        window.clearTimeout(task.pollTimer);
         task.controller.abort();
       }
       activeGenerationsRef.current.clear();
@@ -2030,9 +2037,8 @@ export function App() {
         }
 
         const project = (await response.json()) as ProjectState;
-        const snapshot = filterLoadingPlaceholdersFromSnapshot(project.snapshot);
-        if (isPersistedSnapshot(snapshot)) {
-          setProjectSnapshot(snapshot);
+        if (isPersistedSnapshot(project.snapshot)) {
+          setProjectSnapshot(project.snapshot);
         }
         setGenerationHistory(project.history);
         setSaveStatus("saved");
@@ -2415,6 +2421,7 @@ export function App() {
 
   const handleEditorMount = useCallback((editor: Editor) => {
     editorRef.current = editor;
+    setEditorMountVersion((version) => version + 1);
     if (!editor.user.getIsSnapMode()) {
       editor.user.updateUserPreferences({ isSnapMode: true });
     }
@@ -2454,7 +2461,7 @@ export function App() {
             "Content-Type": "application/json"
           },
           body: JSON.stringify({
-            snapshot: filterLoadingPlaceholdersFromSnapshot(editor.getSnapshot())
+            snapshot: editor.getSnapshot()
           })
         });
 
@@ -2541,6 +2548,168 @@ export function App() {
     setGenerationWarning("");
   }
 
+  function finishActiveGeneration(requestId: number): void {
+    const task = activeGenerationsRef.current.get(requestId);
+    if (task) {
+      window.clearTimeout(task.pollTimer);
+    }
+    if (activeGenerationsRef.current.delete(requestId)) {
+      setActiveGenerationCount(activeGenerationsRef.current.size);
+    }
+  }
+
+  function scheduleGenerationPoll(requestId: number, generationId: string, delayMs = 1400): void {
+    const task = activeGenerationsRef.current.get(requestId);
+    if (!task || task.controller.signal.aborted) {
+      return;
+    }
+
+    window.clearTimeout(task.pollTimer);
+    task.pollTimer = window.setTimeout(() => {
+      void pollGenerationRecord(requestId, generationId);
+    }, delayMs);
+  }
+
+  async function pollGenerationRecord(requestId: number, generationId: string): Promise<void> {
+    const task = activeGenerationsRef.current.get(requestId);
+    if (!task || task.controller.signal.aborted) {
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/generations/${encodeURIComponent(generationId)}`);
+      if (!response.ok) {
+        throw new Error(await readErrorMessage(response, locale, t));
+      }
+
+      const body = (await response.json()) as unknown;
+      if (!isGenerationResponse(body)) {
+        throw new Error(t("generationInvalidResponse"));
+      }
+
+      if (body.record.status === "running" || body.record.status === "pending") {
+        setGenerationHistory((history) =>
+          history.map((record) => (record.id === body.record.id || record.id === task.temporaryRecordId ? body.record : record))
+        );
+        scheduleGenerationPoll(requestId, generationId);
+        return;
+      }
+
+      await applyCompletedGenerationRecord(requestId, body.record);
+    } catch {
+      if (activeGenerationsRef.current.has(requestId)) {
+        scheduleGenerationPoll(requestId, generationId, 2400);
+      }
+    }
+  }
+
+  async function applyCompletedGenerationRecord(requestId: number, record: GenerationRecord): Promise<void> {
+    const task = activeGenerationsRef.current.get(requestId);
+    if (!task) {
+      return;
+    }
+
+    const editor = editorRef.current;
+    if (record.status === "cancelled") {
+      if (editor) {
+        deleteLoadingGenerationPlaceholders(editor, task.placeholderSet);
+      }
+      setGenerationHistory((history) => [record, ...history.filter((item) => item.id !== task.temporaryRecordId && item.id !== record.id)].slice(0, 20));
+      setGenerationError("");
+      setGenerationMessage(record.error ?? t("generationUnknownCancel"));
+      setGenerationWarning("");
+      finishActiveGeneration(requestId);
+      return;
+    }
+
+    if (!editor) {
+      setGenerationHistory((history) => [record, ...history.filter((item) => item.id !== task.temporaryRecordId && item.id !== record.id)].slice(0, 20));
+      finishActiveGeneration(requestId);
+      return;
+    }
+
+    await preloadGenerationRecordPreviews(record, task.controller.signal);
+    if (task.controller.signal.aborted || !activeGenerationsRef.current.has(requestId)) {
+      return;
+    }
+
+    setGenerationHistory((history) => [record, ...history.filter((item) => item.id !== task.temporaryRecordId && item.id !== record.id)].slice(0, 20));
+    const insertedCount = replaceGenerationPlaceholders(editor, task.placeholderSet, record, t);
+    const failedCount =
+      record.outputs.filter((output) => output.status === "failed").length +
+      Math.max(0, task.placeholderSet.placements.length - record.outputs.length);
+    const cloudFailedCount = cloudFailureCount(record);
+    if (insertedCount > 0) {
+      if (cloudFailedCount > 0 || failedCount > 0) {
+        setGenerationWarning(generationWarningMessage(record, insertedCount, failedCount, cloudFailedCount, t));
+      } else {
+        setGenerationMessage(t("generationImageInserted", { count: insertedCount }));
+      }
+      showGenerationCompleteNotification(record, insertedCount, failedCount, t);
+    } else {
+      markGenerationPlaceholdersFailed(editor, task.placeholderSet, generationFailureMessage(record, t));
+      setGenerationError(generationFailureMessage(record, t));
+    }
+
+    finishActiveGeneration(requestId);
+  }
+
+  function createActiveGenerationTask(record: GenerationRecord, placeholderSet: ActiveGenerationPlaceholders, requestId: number): void {
+    activeGenerationsRef.current.set(requestId, {
+      requestId,
+      temporaryRecordId: record.id,
+      controller: new AbortController(),
+      placeholderSet,
+      serverGenerationId: record.id
+    });
+    restoredGenerationIdsRef.current.add(record.id);
+    setActiveGenerationCount(activeGenerationsRef.current.size);
+  }
+
+  function restoreCompletedGenerationRecord(requestId: number, record: GenerationRecord): void {
+    void applyCompletedGenerationRecord(requestId, record).catch((error) => {
+      const task = activeGenerationsRef.current.get(requestId);
+      const message = error instanceof Error ? error.message : t("generationErrorDefault");
+      const editor = editorRef.current;
+      if (editor && task) {
+        markGenerationPlaceholdersFailed(editor, task.placeholderSet, message);
+      }
+      setGenerationError(message);
+      finishActiveGeneration(requestId);
+    });
+  }
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!isProjectLoaded || !editor || editorMountVersion === 0) {
+      return;
+    }
+
+    for (const record of generationHistory) {
+      if (restoredGenerationIdsRef.current.has(record.id)) {
+        continue;
+      }
+      if (Array.from(activeGenerationsRef.current.values()).some((task) => task.serverGenerationId === record.id || task.temporaryRecordId === record.id)) {
+        restoredGenerationIdsRef.current.add(record.id);
+        continue;
+      }
+
+      const requestId = generationRequestRef.current + 1;
+      const placeholderSet = placeholderSetForGeneration(editor, record.id, requestId);
+      if (!placeholderSet) {
+        continue;
+      }
+
+      generationRequestRef.current = requestId;
+      createActiveGenerationTask(record, placeholderSet, requestId);
+      if (isPendingGenerationRecord(record)) {
+        scheduleGenerationPoll(requestId, record.id, 0);
+      } else {
+        restoreCompletedGenerationRecord(requestId, record);
+      }
+    }
+  }, [editorMountVersion, generationHistory, isProjectLoaded]);
+
   async function executeGeneration(
     input: GenerationSubmitInput,
     requestMode: GenerationMode,
@@ -2567,12 +2736,14 @@ export function App() {
 
     const controller = new AbortController();
     const requestId = generationRequestRef.current + 1;
+    const serverGenerationId = crypto.randomUUID();
     generationRequestRef.current = requestId;
-    const placeholderSet = createGenerationPlaceholders(editor, input, requestId, {
+    const placeholderSet = createGenerationPlaceholders(editor, input, serverGenerationId, {
       selectPlaceholders: requestMode !== "reference"
     });
     const temporaryRecord = createTemporaryGenerationRecord({
       requestId,
+      generationId: serverGenerationId,
       submitInput: input,
       requestMode,
       referenceAssetIds
@@ -2582,7 +2753,8 @@ export function App() {
       requestId,
       temporaryRecordId: temporaryRecord.id,
       controller,
-      placeholderSet
+      placeholderSet,
+      serverGenerationId
     });
     setActiveGenerationCount(activeGenerationsRef.current.size);
     setGenerationHistory((history) => [temporaryRecord, ...history.filter((record) => record.id !== temporaryRecord.id)].slice(0, 20));
@@ -2594,6 +2766,7 @@ export function App() {
       }
 
       const requestBody: Record<string, unknown> = {
+        generationId: serverGenerationId,
         prompt: input.prompt.trim(),
         presetId: input.presetId,
         sizePresetId: input.sizePresetId,
@@ -2632,28 +2805,22 @@ export function App() {
         return;
       }
 
-      await preloadGenerationRecordPreviews(body.record, controller.signal);
-      if (controller.signal.aborted || !activeGenerationsRef.current.has(requestId)) {
+      const activeTask = activeGenerationsRef.current.get(requestId);
+      if (!activeTask) {
         return;
       }
 
+      updateGenerationPlaceholderRequestId(editor, placeholderSet, body.record.id);
+      activeTask.temporaryRecordId = body.record.id;
+      activeTask.serverGenerationId = body.record.id;
       setGenerationHistory((history) =>
         [body.record, ...history.filter((record) => record.id !== temporaryRecord.id && record.id !== body.record.id)].slice(0, 20)
       );
-      const insertedCount = replaceGenerationPlaceholders(editor, placeholderSet, body.record, t);
-      const failedCount =
-        body.record.outputs.filter((output) => output.status === "failed").length +
-        Math.max(0, placeholderSet.placements.length - body.record.outputs.length);
-      const cloudFailedCount = cloudFailureCount(body.record);
-      if (insertedCount > 0) {
-        if (cloudFailedCount > 0 || failedCount > 0) {
-          setGenerationWarning(generationWarningMessage(body.record, insertedCount, failedCount, cloudFailedCount, t));
-        } else {
-          setGenerationMessage(t("generationImageInserted", { count: insertedCount }));
-        }
-        showGenerationCompleteNotification(body.record, insertedCount, failedCount, t);
+
+      if (body.record.status === "running" || body.record.status === "pending") {
+        scheduleGenerationPoll(requestId, body.record.id);
       } else {
-        setGenerationError(generationFailureMessage(body.record, t));
+        await applyCompletedGenerationRecord(requestId, body.record);
       }
     } catch (error) {
       if (controller.signal.aborted || !activeGenerationsRef.current.has(requestId)) {
@@ -2667,8 +2834,9 @@ export function App() {
       );
       setGenerationError(message);
     } finally {
-      if (activeGenerationsRef.current.delete(requestId)) {
-        setActiveGenerationCount(activeGenerationsRef.current.size);
+      const activeTask = activeGenerationsRef.current.get(requestId);
+      if (activeTask && !activeTask.serverGenerationId) {
+        finishActiveGeneration(requestId);
       }
     }
   }
@@ -2875,13 +3043,19 @@ export function App() {
     }
   }
 
-  function cancelGeneration(requestId: number): void {
+  async function cancelGeneration(requestId: number): Promise<void> {
     const task = activeGenerationsRef.current.get(requestId);
     if (!task) {
       return;
     }
 
+    window.clearTimeout(task.pollTimer);
     task.controller.abort();
+    let cancelledRecord: GenerationRecord | undefined;
+    if (task.serverGenerationId) {
+      cancelledRecord = await cancelServerGeneration(task.serverGenerationId).catch(() => undefined);
+    }
+
     const editor = editorRef.current;
     if (editor) {
       deleteLoadingGenerationPlaceholders(editor, task.placeholderSet);
@@ -2890,13 +3064,60 @@ export function App() {
     activeGenerationsRef.current.delete(requestId);
     setActiveGenerationCount(activeGenerationsRef.current.size);
     setGenerationHistory((history) =>
-      history.map((record) =>
-        record.id === task.temporaryRecordId ? { ...record, status: "cancelled", error: t("generationUnknownCancel") } : record
-      )
+      history.map((record) => {
+        if (record.id !== task.temporaryRecordId && record.id !== task.serverGenerationId) {
+          return record;
+        }
+        return cancelledRecord ?? { ...record, status: "cancelled", error: t("generationUnknownCancel") };
+      })
     );
     setGenerationError("");
-    setGenerationMessage(t("generationUnknownCancel"));
+    setGenerationMessage(cancelledRecord?.error ?? t("generationUnknownCancel"));
     setGenerationWarning("");
+  }
+
+  async function cancelServerGeneration(generationId: string): Promise<GenerationRecord> {
+    const response = await fetch(`/api/generations/${encodeURIComponent(generationId)}/cancel`, {
+      method: "POST"
+    });
+    if (!response.ok) {
+      throw new Error(await readErrorMessage(response, locale, t));
+    }
+
+    const body = (await response.json()) as unknown;
+    if (!isGenerationResponse(body)) {
+      throw new Error(t("generationInvalidResponse"));
+    }
+
+    return body.record;
+  }
+
+  async function cancelHistoryGeneration(generationId: string): Promise<void> {
+    try {
+      const record = await cancelServerGeneration(generationId);
+      const editor = editorRef.current;
+      if (editor) {
+        const requestId = generationRequestRef.current + 1;
+        const placeholderSet = placeholderSetForGeneration(editor, generationId, requestId);
+        if (placeholderSet) {
+          generationRequestRef.current = requestId;
+          createActiveGenerationTask(record, placeholderSet, requestId);
+          if (isPendingGenerationRecord(record)) {
+            scheduleGenerationPoll(requestId, record.id, 0);
+          } else {
+            restoreCompletedGenerationRecord(requestId, record);
+          }
+          return;
+        }
+      }
+
+      setGenerationHistory((history) => history.map((item) => (item.id === generationId ? record : item)));
+      setGenerationError("");
+      setGenerationMessage(record.error ?? t("generationUnknownCancel"));
+      setGenerationWarning("");
+    } catch (error) {
+      setGenerationError(error instanceof Error ? error.message : t("generationErrorDefault"));
+    }
   }
 
   return (
@@ -3361,7 +3582,7 @@ export function App() {
                   const excerpt = promptExcerpt(record.prompt);
                   const totalOutputs = record.outputs.length || record.count;
                   const activeTask = Array.from(activeGenerationsRef.current.values()).find((task) => task.temporaryRecordId === record.id);
-                  const isRecordRunning = record.status === "running" && Boolean(activeTask);
+                  const isRecordRunning = isPendingGenerationRecord(record);
                   const cloudFailedCount = cloudFailureCount(record);
                   const cloudFailureMessage = firstCloudFailureMessage(record);
 
@@ -3442,14 +3663,14 @@ export function App() {
                         >
                           <RotateCcw className="size-4" aria-hidden="true" />
                         </button>
-                        {activeTask && record.status === "running" ? (
+                        {isPendingGenerationRecord(record) ? (
                           <button
                             aria-label={t("historyCancelTask", { excerpt })}
                             className="history-icon-action"
                             type="button"
                             data-testid="history-cancel"
                             title={t("commonCancel")}
-                            onClick={() => cancelGeneration(activeTask.requestId)}
+                            onClick={() => void (activeTask ? cancelGeneration(activeTask.requestId) : cancelHistoryGeneration(record.id))}
                           >
                             <XCircle className="size-4" aria-hidden="true" />
                           </button>

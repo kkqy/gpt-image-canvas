@@ -151,6 +151,25 @@ export function getAssetPromptMetadata(assetId: string): AssetPromptMetadata | u
     .get();
 }
 
+export function getGenerationRecord(generationId: string): ApiGenerationRecord | undefined {
+  const record = db.select().from(generationRecords).where(eq(generationRecords.id, generationId)).get();
+  if (!record) {
+    return undefined;
+  }
+
+  return mapGenerationRecordRows([record])[0];
+}
+
+export function markStaleRunningGenerationsFailed(message: string): void {
+  db.update(generationRecords)
+    .set({
+      status: "failed",
+      error: message
+    })
+    .where(eq(generationRecords.status, "running"))
+    .run();
+}
+
 function getDefaultProjectRow(): (typeof projects.$inferSelect) | undefined {
   try {
     return db.select().from(projects).where(eq(projects.id, DEFAULT_PROJECT_ID)).get();
@@ -205,6 +224,10 @@ function formatErrorSummary(error: unknown): string {
 
 function readGenerationHistory(): ApiGenerationRecord[] {
   const records = db.select().from(generationRecords).orderBy(desc(generationRecords.createdAt)).limit(20).all();
+  return mapGenerationRecordRows(records);
+}
+
+function mapGenerationRecordRows(records: Array<typeof generationRecords.$inferSelect>): ApiGenerationRecord[] {
   if (records.length === 0) {
     return [];
   }
@@ -253,7 +276,7 @@ function readGenerationHistory(): ApiGenerationRecord[] {
       error: output.error ?? undefined
     }));
 
-    if (mappedOutputs.length === 0) {
+    if (mappedOutputs.length === 0 && record.status === "succeeded") {
       return [];
     }
 
