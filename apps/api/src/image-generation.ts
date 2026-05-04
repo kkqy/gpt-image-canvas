@@ -33,7 +33,7 @@ import { runtimePaths } from "./runtime.js";
 import { assets, generationOutputs, generationRecords, generationReferenceAssets } from "./schema.js";
 import { getActiveCosStorageConfig } from "./storage-config.js";
 
-const BATCH_CONCURRENCY = 2;
+const DEFAULT_BATCH_CONCURRENCY = 2;
 const MAX_REFERENCE_IMAGE_BYTES = 50 * 1024 * 1024;
 const SUPPORTED_REFERENCE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp"]);
 const localAssetStorage = new LocalAssetStorageAdapter();
@@ -86,7 +86,7 @@ const mimeTypes: Record<OutputFormat, string> = {
 export async function runTextToImageGeneration(input: ImageProviderInput, provider: ImageProvider, signal?: AbortSignal): Promise<GenerationResponse> {
   const outputs = await mapWithConcurrency(
     Array.from({ length: input.count }, (_, index) => index),
-    BATCH_CONCURRENCY,
+    getBatchConcurrency(),
     async () => generateSingleOutput(input, provider, signal)
   );
 
@@ -117,7 +117,7 @@ export async function runReferenceImageGeneration(
 
   const outputs = await mapWithConcurrency(
     Array.from({ length: inputWithReferenceAssets.count }, (_, index) => index),
-    BATCH_CONCURRENCY,
+    getBatchConcurrency(),
     async () => editSingleOutput(inputWithReferenceAssets, provider, signal)
   );
 
@@ -620,6 +620,15 @@ async function mapWithConcurrency<T, TResult>(
 
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
   return results;
+}
+
+function getBatchConcurrency(): number {
+  const parsed = Number.parseInt(process.env.OPENAI_IMAGE_BATCH_CONCURRENCY ?? "", 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return DEFAULT_BATCH_CONCURRENCY;
+  }
+
+  return parsed;
 }
 
 function errorToMessage(error: unknown): string {
