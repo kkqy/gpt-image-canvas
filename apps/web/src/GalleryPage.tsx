@@ -1,5 +1,6 @@
 import {
   AlertTriangle,
+  Check,
   ChevronDown,
   Clock3,
   Copy,
@@ -46,8 +47,10 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   const [statusMessage, setStatusMessage] = useState("");
   const [expandedPrompts, setExpandedPrompts] = useState<Record<string, boolean>>({});
   const [selectedItem, setSelectedItem] = useState<GalleryImageItem | null>(null);
+  const [selectedOutputIds, setSelectedOutputIds] = useState<Set<string>>(() => new Set());
   const [pendingDeleteItem, setPendingDeleteItem] = useState<GalleryImageItem | null>(null);
-  const [deletingOutputId, setDeletingOutputId] = useState<string | null>(null);
+  const [pendingBatchDelete, setPendingBatchDelete] = useState(false);
+  const [deletingOutputIds, setDeletingOutputIds] = useState<Set<string>>(() => new Set());
   const statusTimerRef = useRef<number | undefined>();
 
   useEffect(() => {
@@ -92,7 +95,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   }, [locale, t]);
 
   useEffect(() => {
-    if (!selectedItem && !pendingDeleteItem) {
+    if (!selectedItem && !pendingDeleteItem && !pendingBatchDelete) {
       return;
     }
 
@@ -107,6 +110,11 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
         return;
       }
 
+      if (pendingBatchDelete) {
+        setPendingBatchDelete(false);
+        return;
+      }
+
       setSelectedItem(null);
     };
 
@@ -114,13 +122,31 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [pendingDeleteItem, selectedItem]);
+  }, [pendingBatchDelete, pendingDeleteItem, selectedItem]);
 
   useEffect(() => {
     return () => {
       window.clearTimeout(statusTimerRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    setSelectedOutputIds((current) => {
+      if (current.size === 0) {
+        return current;
+      }
+
+      const existingOutputIds = new Set(items.map((item) => item.outputId));
+      const next = new Set<string>();
+      for (const outputId of current) {
+        if (existingOutputIds.has(outputId)) {
+          next.add(outputId);
+        }
+      }
+
+      return next.size === current.size ? current : next;
+    });
+  }, [items]);
 
   const filteredItems = useMemo(() => {
     const normalizedQuery = normalizeSearchText(query);
@@ -132,6 +158,12 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   }, [items, query]);
   const featuredItem = filteredItems[0] ?? null;
   const gridItems = featuredItem ? filteredItems.slice(1) : filteredItems;
+  const selectedItems = useMemo(
+    () => items.filter((item) => selectedOutputIds.has(item.outputId)),
+    [items, selectedOutputIds]
+  );
+  const allFilteredItemsSelected = filteredItems.length > 0 && filteredItems.every((item) => selectedOutputIds.has(item.outputId));
+  const isDeleting = deletingOutputIds.size > 0;
   const actionHandlers: GalleryActionHandlers = {
     onCopy: (item) => void copyPrompt(item),
     onDelete: requestDelete,
@@ -169,13 +201,46 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
     showStatus(t("galleryOpenDownload"));
   }
 
+  function downloadSelectedItems(): void {
+    for (const item of selectedItems) {
+      triggerAssetDownload(item);
+    }
+    showStatus(t("galleryBatchDownloadStarted", { count: selectedItems.length }));
+  }
+
+  function toggleSelectedItem(item: GalleryImageItem): void {
+    setSelectedOutputIds((current) => {
+      const next = new Set(current);
+      if (next.has(item.outputId)) {
+        next.delete(item.outputId);
+      } else {
+        next.add(item.outputId);
+      }
+      return next;
+    });
+  }
+
+  function selectFilteredItems(): void {
+    setSelectedOutputIds((current) => {
+      const next = new Set(current);
+      for (const item of filteredItems) {
+        next.add(item.outputId);
+      }
+      return next;
+    });
+  }
+
+  function clearSelection(): void {
+    setSelectedOutputIds(new Set());
+  }
+
   function requestDelete(item: GalleryImageItem): void {
     setError("");
     setPendingDeleteItem(item);
   }
 
   async function deleteItem(item: GalleryImageItem): Promise<void> {
-    setDeletingOutputId(item.outputId);
+    setDeletingOutputIds(new Set([item.outputId]));
     setError("");
 
     try {
@@ -187,6 +252,14 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
       }
 
       setItems((current) => current.filter((galleryItem) => galleryItem.outputId !== item.outputId));
+      setSelectedOutputIds((current) => {
+        if (!current.has(item.outputId)) {
+          return current;
+        }
+        const next = new Set(current);
+        next.delete(item.outputId);
+        return next;
+      });
       setSelectedItem((current) => (current?.outputId === item.outputId ? null : current));
       setPendingDeleteItem(null);
       onDeleted(item.outputId);
@@ -194,7 +267,76 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : t("galleryDeleteFailed"));
     } finally {
-      setDeletingOutputId(null);
+      setDeletingOutputIds(new Set());
+    }
+  }
+
+  async function deleteSelectedItems(): Promise<void> {
+    const outputIds = selectedItems.map((item) => item.outputId);
+    if (outputIds.length === 0) {
+      return;
+    }
+
+    setDeletingOutputIds(new Set(outputIds));
+    setError("");
+
+    const deletedOutputIds: string[] = [];
+    let firstError: Error | undefined;
+    try {
+      const results = await Promise.all(
+        outputIds.map(async (outputId) => {
+          try {
+            const response = await fetch(`/api/gallery/${encodeURIComponent(outputId)}`, {
+              method: "DELETE"
+            });
+            if (!response.ok) {
+              throw new Error(await readGalleryError(response, locale, t));
+            }
+            return { outputId };
+          } catch (deleteError) {
+            return {
+              error: deleteError instanceof Error ? deleteError : new Error(t("galleryBatchDeleteFailed")),
+              outputId
+            };
+          }
+        })
+      );
+
+      for (const result of results) {
+        if (result.error) {
+          firstError ??= result.error;
+        } else {
+          deletedOutputIds.push(result.outputId);
+        }
+      }
+    } catch {
+      firstError = new Error(t("galleryBatchDeleteFailed"));
+    } finally {
+      if (deletedOutputIds.length > 0) {
+        const deletedSet = new Set(deletedOutputIds);
+        setItems((current) => current.filter((galleryItem) => !deletedSet.has(galleryItem.outputId)));
+        setSelectedOutputIds((current) => {
+          const next = new Set(current);
+          for (const outputId of deletedSet) {
+            next.delete(outputId);
+          }
+          return next;
+        });
+        setSelectedItem((current) => (current && deletedSet.has(current.outputId) ? null : current));
+        for (const outputId of deletedOutputIds) {
+          onDeleted(outputId);
+        }
+        if (!firstError) {
+          showStatus(t("galleryBatchDeleted", { count: deletedOutputIds.length }));
+        }
+      }
+
+      if (firstError) {
+        setError(firstError.message);
+      }
+
+      setPendingBatchDelete(false);
+      setDeletingOutputIds(new Set());
     }
   }
 
@@ -229,6 +371,17 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
           </div>
         </header>
 
+        <GalleryBulkToolbar
+          allFilteredItemsSelected={allFilteredItemsSelected}
+          disabled={isDeleting}
+          filteredCount={filteredItems.length}
+          selectedCount={selectedOutputIds.size}
+          onClearSelection={clearSelection}
+          onDeleteSelected={() => setPendingBatchDelete(true)}
+          onDownloadSelected={downloadSelectedItems}
+          onSelectFiltered={selectFilteredItems}
+        />
+
         {error ? (
           <div className="gallery-alert gallery-alert--error" data-testid="gallery-error" role="alert">
             <XCircle className="size-4 shrink-0" aria-hidden="true" />
@@ -259,10 +412,12 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
           <>
             {featuredItem ? (
               <FeaturedGalleryItem
-                deleting={deletingOutputId === featuredItem.outputId}
+                deleting={deletingOutputIds.has(featuredItem.outputId)}
                 expanded={Boolean(expandedPrompts[featuredItem.outputId])}
+                isSelected={selectedOutputIds.has(featuredItem.outputId)}
                 item={featuredItem}
                 onOpen={setSelectedItem}
+                onToggleSelected={toggleSelectedItem}
                 onTogglePrompt={togglePrompt}
                 {...actionHandlers}
               />
@@ -272,11 +427,13 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
               <div className="gallery-grid" data-testid="gallery-grid">
                 {gridItems.map((item) => (
                   <GalleryCard
-                    deleting={deletingOutputId === item.outputId}
+                    deleting={deletingOutputIds.has(item.outputId)}
                     expanded={Boolean(expandedPrompts[item.outputId])}
+                    isSelected={selectedOutputIds.has(item.outputId)}
                     item={item}
                     key={item.outputId}
                     onOpen={setSelectedItem}
+                    onToggleSelected={toggleSelectedItem}
                     onTogglePrompt={togglePrompt}
                     {...actionHandlers}
                   />
@@ -289,7 +446,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
 
       {selectedItem ? (
         <GalleryDetailDialog
-          deleting={deletingOutputId === selectedItem.outputId}
+          deleting={deletingOutputIds.has(selectedItem.outputId)}
           item={selectedItem}
           onClose={() => setSelectedItem(null)}
           onCopy={() => void copyPrompt(selectedItem)}
@@ -301,37 +458,95 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
 
       {pendingDeleteItem ? (
         <DeleteGalleryDialog
-          deleting={deletingOutputId === pendingDeleteItem.outputId}
+          deleting={deletingOutputIds.has(pendingDeleteItem.outputId)}
           item={pendingDeleteItem}
           onCancel={() => setPendingDeleteItem(null)}
           onConfirm={() => void deleteItem(pendingDeleteItem)}
+        />
+      ) : null}
+
+      {pendingBatchDelete ? (
+        <DeleteGalleryBatchDialog
+          count={selectedOutputIds.size}
+          deleting={isDeleting}
+          onCancel={() => setPendingBatchDelete(false)}
+          onConfirm={() => void deleteSelectedItems()}
         />
       ) : null}
     </main>
   );
 }
 
+function GalleryBulkToolbar({
+  allFilteredItemsSelected,
+  disabled,
+  filteredCount,
+  selectedCount,
+  onClearSelection,
+  onDeleteSelected,
+  onDownloadSelected,
+  onSelectFiltered
+}: {
+  allFilteredItemsSelected: boolean;
+  disabled: boolean;
+  filteredCount: number;
+  selectedCount: number;
+  onClearSelection: () => void;
+  onDeleteSelected: () => void;
+  onDownloadSelected: () => void;
+  onSelectFiltered: () => void;
+}) {
+  const { t } = useI18n();
+  const hasSelection = selectedCount > 0;
+
+  return (
+    <section className="gallery-bulk-toolbar" data-testid="gallery-bulk-toolbar" aria-label={t("galleryBatchActionsLabel")}>
+      <p className="gallery-bulk-toolbar__count">{t("gallerySelectedCount", { count: selectedCount })}</p>
+      <div className="gallery-bulk-toolbar__actions">
+        <button className="secondary-action h-10" disabled={disabled || filteredCount === 0 || allFilteredItemsSelected} type="button" onClick={onSelectFiltered}>
+          {t("gallerySelectCurrent")}
+        </button>
+        <button className="secondary-action h-10" disabled={disabled || !hasSelection} type="button" onClick={onClearSelection}>
+          {t("galleryClearSelection")}
+        </button>
+        <button className="secondary-action h-10" disabled={disabled || !hasSelection} type="button" onClick={onDownloadSelected}>
+          <Download className="size-4" aria-hidden="true" />
+          {t("galleryBatchDownload")}
+        </button>
+        <button className="danger-action h-10" disabled={disabled || !hasSelection} type="button" onClick={onDeleteSelected}>
+          {disabled ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <Trash2 className="size-4" aria-hidden="true" />}
+          {t("galleryBatchDelete")}
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function FeaturedGalleryItem({
   deleting,
   expanded,
+  isSelected,
   item,
   onCopy,
   onDelete,
   onDownload,
   onOpen,
   onReuse,
+  onToggleSelected,
   onTogglePrompt
 }: {
   deleting: boolean;
   expanded: boolean;
+  isSelected: boolean;
   item: GalleryImageItem;
   onOpen: (item: GalleryImageItem) => void;
+  onToggleSelected: (item: GalleryImageItem) => void;
   onTogglePrompt: (outputId: string) => void;
 } & GalleryActionHandlers) {
   const { formatDateTime, t } = useI18n();
 
   return (
-    <article className="gallery-feature" data-testid="gallery-feature">
+    <article className="gallery-feature" data-selected={isSelected} data-testid="gallery-feature">
       <button
         aria-label={t("galleryActionOpenLatest", { excerpt: promptExcerpt(item.prompt) })}
         className="gallery-feature__image-button"
@@ -350,6 +565,7 @@ function FeaturedGalleryItem({
           <Maximize2 className="size-4" aria-hidden="true" />
         </span>
       </button>
+      <GallerySelectButton isSelected={isSelected} item={item} onToggleSelected={onToggleSelected} />
 
       <div className="gallery-feature__body">
         <GalleryTags item={item} />
@@ -388,24 +604,28 @@ function FeaturedGalleryItem({
 function GalleryCard({
   deleting,
   expanded,
+  isSelected,
   item,
   onCopy,
   onDelete,
   onDownload,
   onOpen,
   onReuse,
+  onToggleSelected,
   onTogglePrompt
 }: {
   deleting: boolean;
   expanded: boolean;
+  isSelected: boolean;
   item: GalleryImageItem;
   onOpen: (item: GalleryImageItem) => void;
+  onToggleSelected: (item: GalleryImageItem) => void;
   onTogglePrompt: (outputId: string) => void;
 } & GalleryActionHandlers) {
   const { formatDateTime, t } = useI18n();
 
   return (
-    <article className="gallery-card" data-testid="gallery-card">
+    <article className="gallery-card" data-selected={isSelected} data-testid="gallery-card">
       <button
         aria-label={t("galleryActionOpenImage", { excerpt: promptExcerpt(item.prompt) })}
         className="gallery-card__image-button"
@@ -424,6 +644,7 @@ function GalleryCard({
           <Maximize2 className="size-4" aria-hidden="true" />
         </span>
       </button>
+      <GallerySelectButton isSelected={isSelected} item={item} onToggleSelected={onToggleSelected} />
 
       <div className="gallery-card__body">
         <GalleryTags item={item} compact />
@@ -450,6 +671,34 @@ function GalleryCard({
         </div>
       </div>
     </article>
+  );
+}
+
+function GallerySelectButton({
+  isSelected,
+  item,
+  onToggleSelected
+}: {
+  isSelected: boolean;
+  item: GalleryImageItem;
+  onToggleSelected: (item: GalleryImageItem) => void;
+}) {
+  const { t } = useI18n();
+
+  return (
+    <button
+      aria-pressed={isSelected}
+      aria-label={t("gallerySelectImage", { excerpt: promptExcerpt(item.prompt) })}
+      className="gallery-select-button"
+      data-selected={isSelected}
+      type="button"
+      onClick={(event) => {
+        event.stopPropagation();
+        onToggleSelected(item);
+      }}
+    >
+      {isSelected ? <Check className="size-4" aria-hidden="true" /> : null}
+    </button>
   );
 }
 
@@ -699,6 +948,60 @@ function DeleteGalleryDialog({
       </div>
     </div>
   );
+}
+
+function DeleteGalleryBatchDialog({
+  count,
+  deleting,
+  onCancel,
+  onConfirm
+}: {
+  count: number;
+  deleting: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const { t } = useI18n();
+
+  return (
+    <div className="gallery-confirm-backdrop" data-testid="gallery-batch-delete-dialog" role="presentation">
+      <div
+        aria-describedby="gallery-batch-delete-description"
+        aria-labelledby="gallery-batch-delete-title"
+        aria-modal="true"
+        className="gallery-confirm"
+        role="dialog"
+      >
+        <div className="gallery-confirm__icon">
+          <AlertTriangle className="size-5" aria-hidden="true" />
+        </div>
+        <div className="gallery-confirm__copy">
+          <h2 id="gallery-batch-delete-title">{t("galleryBatchDeleteTitle", { count })}</h2>
+          <p id="gallery-batch-delete-description">{t("galleryBatchDeleteBody", { count })}</p>
+        </div>
+        <div className="gallery-confirm__actions">
+          <button className="secondary-action h-10" disabled={deleting} type="button" onClick={onCancel}>
+            {t("commonCancel")}
+          </button>
+          <button className="danger-action h-10" disabled={deleting} type="button" onClick={onConfirm}>
+            {deleting ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <Trash2 className="size-4" aria-hidden="true" />}
+            {t("galleryConfirmRemove")}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function triggerAssetDownload(item: GalleryImageItem): void {
+  const link = document.createElement("a");
+  link.href = `/api/assets/${encodeURIComponent(item.asset.id)}/download`;
+  link.rel = "noopener noreferrer";
+  link.target = "_blank";
+  link.style.display = "none";
+  document.body.append(link);
+  link.click();
+  link.remove();
 }
 
 function assetPreviewUrl(assetId: string, width: number): string {
