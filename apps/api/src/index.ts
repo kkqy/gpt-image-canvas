@@ -4,6 +4,7 @@ import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import type { Context } from "hono";
+import sharp from "sharp";
 import { parsePreviewWidth, readStoredAssetPreview } from "./asset-preview.js";
 import {
   getAuthStatus,
@@ -48,17 +49,33 @@ import {
   runReferenceImageGeneration,
   runTextToImageGeneration
 } from "./image-generation.js";
-import { deleteGalleryOutput, getGalleryImages, getProjectState, saveProjectSnapshot } from "./project-store.js";
+import {
+  deleteGalleryOutput,
+  getAssetPromptMetadata,
+  getGalleryImages,
+  getProjectState,
+  saveProjectSnapshot,
+  type AssetPromptMetadata
+} from "./project-store.js";
 import { getProviderConfig, isProviderSourceOrder, saveProviderConfig } from "./provider-config.js";
 import { runtimePaths, serverConfig } from "./runtime.js";
 import { getStorageConfig, saveStorageConfig, testStorageConfig } from "./storage-config.js";
 
 const MAX_PROJECT_SNAPSHOT_BYTES = 100 * 1024 * 1024;
 const MAX_PROJECT_NAME_LENGTH = 120;
+const PROMPT_METADATA_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const WINDOWS_EXIF_TEXT_LIMIT = 12_000;
 
 interface ProjectPayload {
   name?: string;
   snapshotJson: string;
+}
+
+interface PromptMetadataDownloadInput {
+  assetId: string;
+  bytes: Buffer;
+  mimeType: string;
+  promptMetadata?: AssetPromptMetadata;
 }
 
 export const app = new Hono();
@@ -235,12 +252,20 @@ app.get("/api/assets/:id/metadata", async (c) => {
 });
 
 app.get("/api/assets/:id/download", async (c) => {
-  const asset = await readStoredAsset(c.req.param("id"));
+  const assetId = c.req.param("id");
+  const asset = await readStoredAsset(assetId);
   if (!asset) {
     return c.json(errorResponse("not_found", "找不到请求的图像资源。"), 404);
   }
 
-  return new Response(new Uint8Array(asset.bytes), {
+  const bytes = await embedPromptMetadataForDownload({
+    assetId,
+    bytes: asset.bytes,
+    mimeType: asset.file.mimeType,
+    promptMetadata: getAssetPromptMetadata(assetId)
+  });
+
+  return new Response(new Uint8Array(bytes), {
     status: 200,
     headers: {
       "Cache-Control": "private, max-age=31536000, immutable",
@@ -355,6 +380,81 @@ function errorResponse(code: string, message: string): ErrorResponseBody {
 
 function downloadFileName(fileName: string): string {
   return fileName.replace(/[^a-zA-Z0-9._-]/gu, "_");
+}
+
+async function embedPromptMetadataForDownload(input: PromptMetadataDownloadInput): Promise<Buffer> {
+  if (!input.promptMetadata || !PROMPT_METADATA_MIME_TYPES.has(input.mimeType)) {
+    return input.bytes;
+  }
+
+  try {
+    const image = sharp(input.bytes).keepMetadata().withXmp(buildPromptXmp(input.promptMetadata));
+    if (input.mimeType === "image/jpeg") {
+      image.withExifMerge({
+        IFD0: {
+          XPComment: truncateWindowsExifText(formatWindowsExifPromptComment(input.promptMetadata)),
+          XPKeywords: "gpt-image-canvas",
+          XPSubject: truncateWindowsExifText(input.promptMetadata.prompt),
+          XPTitle: "gpt-image-canvas prompt metadata",
+          Software: "gpt-image-canvas"
+        }
+      });
+    }
+
+    return await image.toBuffer();
+  } catch (error) {
+    console.warn(
+      `Could not embed prompt metadata for asset ${sanitizeLogValue(input.assetId)}. ${errorToMessage(error)}`
+    );
+    return input.bytes;
+  }
+}
+
+function buildPromptXmp(metadata: AssetPromptMetadata): string {
+  const prompt = escapeXml(metadata.prompt);
+  const effectivePrompt = escapeXml(metadata.effectivePrompt);
+
+  return `<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description
+      rdf:about=""
+      xmlns:dc="http://purl.org/dc/elements/1.1/"
+      xmlns:gic="https://github.com/kkqy/gpt-image-canvas/metadata/1.0/">
+      <dc:description>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">${prompt}</rdf:li>
+        </rdf:Alt>
+      </dc:description>
+      <gic:source>gpt-image-canvas</gic:source>
+      <gic:prompt>${prompt}</gic:prompt>
+      <gic:effectivePrompt>${effectivePrompt}</gic:effectivePrompt>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>`;
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, "")
+    .replace(/&/gu, "&amp;")
+    .replace(/</gu, "&lt;")
+    .replace(/>/gu, "&gt;")
+    .replace(/"/gu, "&quot;")
+    .replace(/'/gu, "&apos;");
+}
+
+function formatWindowsExifPromptComment(metadata: AssetPromptMetadata): string {
+  return `Prompt: ${metadata.prompt}\nEffective prompt: ${metadata.effectivePrompt}`;
+}
+
+function truncateWindowsExifText(value: string): string {
+  return value.length <= WINDOWS_EXIF_TEXT_LIMIT ? value : `${value.slice(0, WINDOWS_EXIF_TEXT_LIMIT)}...`;
+}
+
+function sanitizeLogValue(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]/gu, "_");
 }
 
 interface ErrorResponseBody {

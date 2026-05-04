@@ -18,6 +18,11 @@ export const DEFAULT_PROJECT_ID = "default";
 const DEFAULT_PROJECT_NAME = "Default Project";
 const fallbackWarnings = new Set<string>();
 
+export interface AssetPromptMetadata {
+  prompt: string;
+  effectivePrompt: string;
+}
+
 interface ProjectSnapshotInput {
   name?: string;
   snapshotJson: string;
@@ -132,6 +137,18 @@ export function getGalleryImages(): GalleryResponse {
 export function deleteGalleryOutput(outputId: string): boolean {
   const result = db.delete(generationOutputs).where(eq(generationOutputs.id, outputId)).run();
   return result.changes > 0;
+}
+
+export function getAssetPromptMetadata(assetId: string): AssetPromptMetadata | undefined {
+  return db
+    .select({
+      prompt: generationRecords.prompt,
+      effectivePrompt: generationRecords.effectivePrompt
+    })
+    .from(generationOutputs)
+    .innerJoin(generationRecords, eq(generationOutputs.generationId, generationRecords.id))
+    .where(eq(generationOutputs.assetId, assetId))
+    .get();
 }
 
 function getDefaultProjectRow(): (typeof projects.$inferSelect) | undefined {
