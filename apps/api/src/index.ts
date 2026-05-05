@@ -284,6 +284,7 @@ app.get("/api/assets/:id/download", async (c) => {
     headers: {
       "Cache-Control": "private, max-age=31536000, immutable",
       "Content-Disposition": `attachment; filename="${downloadFileName(asset.file.fileName)}"`,
+      "Content-Length": String(bytes.byteLength),
       "Content-Type": asset.file.mimeType
     }
   });

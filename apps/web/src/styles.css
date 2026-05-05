@@ -3381,6 +3381,71 @@ a:focus-visible {
   min-width: max-content;
 }
 
+.gallery-download-progress {
+  display: grid;
+  gap: 0.65rem;
+  border: 1px solid #bfe7df;
+  border-radius: 8px;
+  background: #effbf7;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.72);
+  color: #0f5f58;
+  margin-bottom: 0.8rem;
+  padding: 0.8rem 0.9rem;
+}
+
+.gallery-download-progress__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.85rem;
+}
+
+.gallery-download-progress__header p {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.gallery-download-progress__header span,
+.gallery-download-progress__meta {
+  font-size: 0.76rem;
+}
+
+.gallery-download-progress__header span {
+  display: block;
+  max-width: min(56vw, 36rem);
+  overflow: hidden;
+  color: #24736b;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gallery-download-progress__bar {
+  overflow: hidden;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: rgb(15 95 88 / 0.16);
+}
+
+.gallery-download-progress__bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #0f766e, #14b8a6);
+  transition: width 160ms ease;
+}
+
+.gallery-download-progress__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem 0.8rem;
+  color: #24736b;
+  font-family: var(--font-mono);
+  font-weight: 700;
+}
+
 .gallery-alert {
   border-radius: 7px;
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.72);
@@ -4328,6 +4393,22 @@ a:focus-visible {
   background: rgb(29 24 21 / 0.88);
 }
 
+.app-root[data-canvas-theme="dark"] .gallery-download-progress {
+  border-color: #164e47;
+  background: rgb(20 83 75 / 0.22);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.06);
+  color: #8fe6d9;
+}
+
+.app-root[data-canvas-theme="dark"] .gallery-download-progress__header span,
+.app-root[data-canvas-theme="dark"] .gallery-download-progress__meta {
+  color: #77cfc4;
+}
+
+.app-root[data-canvas-theme="dark"] .gallery-download-progress__bar {
+  background: rgb(143 230 217 / 0.16);
+}
+
 .app-root[data-canvas-theme="dark"] .gallery-bulk-toolbar__count {
   color: var(--muted-ink);
 }
@@ -4657,6 +4738,15 @@ a:focus-visible {
   .gallery-bulk-toolbar__actions .danger-action {
     width: 100%;
     min-width: 0;
+  }
+
+  .gallery-download-progress__header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .gallery-download-progress__header span {
+    max-width: 100%;
   }
 
   .gallery-feature__footer {

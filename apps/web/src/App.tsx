@@ -443,6 +443,16 @@ function firstDownloadableAsset(record: GenerationRecord): GeneratedAsset | unde
   return record.outputs.find((output) => output.status === "succeeded" && output.asset)?.asset;
 }
 
+function triggerAssetDownload(asset: GeneratedAsset): void {
+  const link = document.createElement("a");
+  link.download = asset.fileName;
+  link.href = `/api/assets/${encodeURIComponent(asset.id)}/download`;
+  link.style.display = "none";
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
 function successfulOutputCount(record: GenerationRecord): number {
   return record.outputs.filter((output) => output.status === "succeeded" && output.asset).length;
 }
@@ -3141,7 +3151,7 @@ export function App() {
       return;
     }
 
-    window.open(`/api/assets/${encodeURIComponent(asset.id)}/download`, "_blank", "noopener,noreferrer");
+    triggerAssetDownload(asset);
     setGenerationMessage(t("generationDownloadOpened"));
   }
 

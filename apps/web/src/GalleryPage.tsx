@@ -21,6 +21,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   SIZE_PRESETS,
   STYLE_PRESETS,
+  type GeneratedAsset,
   type GalleryImageItem,
   type GalleryResponse
 } from "@gpt-image-canvas/shared";
@@ -38,6 +39,16 @@ interface GalleryActionHandlers {
   onReuse: (item: GalleryImageItem) => void;
 }
 
+interface BatchDownloadState {
+  isActive: boolean;
+  total: number;
+  completed: number;
+  failed: number;
+  currentFileName: string;
+  currentLoaded: number;
+  currentTotal: number | null;
+}
+
 export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   const { locale, t } = useI18n();
   const [items, setItems] = useState<GalleryImageItem[]>([]);
@@ -51,7 +62,9 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   const [pendingDeleteItem, setPendingDeleteItem] = useState<GalleryImageItem | null>(null);
   const [pendingBatchDelete, setPendingBatchDelete] = useState(false);
   const [deletingOutputIds, setDeletingOutputIds] = useState<Set<string>>(() => new Set());
+  const [batchDownload, setBatchDownload] = useState<BatchDownloadState | null>(null);
   const statusTimerRef = useRef<number | undefined>();
+  const batchDownloadAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -127,6 +140,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   useEffect(() => {
     return () => {
       window.clearTimeout(statusTimerRef.current);
+      batchDownloadAbortRef.current?.abort();
     };
   }, []);
 
@@ -164,6 +178,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   );
   const allFilteredItemsSelected = filteredItems.length > 0 && filteredItems.every((item) => selectedOutputIds.has(item.outputId));
   const isDeleting = deletingOutputIds.size > 0;
+  const isBatchDownloading = batchDownload?.isActive ?? false;
   const actionHandlers: GalleryActionHandlers = {
     onCopy: (item) => void copyPrompt(item),
     onDelete: requestDelete,
@@ -197,15 +212,106 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   }
 
   function downloadItem(item: GalleryImageItem): void {
-    window.open(`/api/assets/${encodeURIComponent(item.asset.id)}/download`, "_blank", "noopener,noreferrer");
+    triggerAssetDownload(item.asset);
     showStatus(t("galleryOpenDownload"));
   }
 
-  function downloadSelectedItems(): void {
-    for (const item of selectedItems) {
-      triggerAssetDownload(item);
+  async function downloadSelectedItems(): Promise<void> {
+    if (selectedItems.length === 0 || isBatchDownloading) {
+      return;
     }
-    showStatus(t("galleryBatchDownloadStarted", { count: selectedItems.length }));
+
+    const queue = [...selectedItems];
+    const controller = new AbortController();
+    batchDownloadAbortRef.current = controller;
+    let completed = 0;
+    let failed = 0;
+
+    window.clearTimeout(statusTimerRef.current);
+    setError("");
+    setStatusMessage("");
+    setBatchDownload({
+      completed,
+      currentFileName: "",
+      currentLoaded: 0,
+      currentTotal: null,
+      failed,
+      isActive: true,
+      total: queue.length
+    });
+
+    for (const item of queue) {
+      if (controller.signal.aborted) {
+        break;
+      }
+
+      setBatchDownload((current) =>
+        current
+          ? {
+              ...current,
+              currentFileName: item.asset.fileName,
+              currentLoaded: 0,
+              currentTotal: null
+            }
+          : current
+      );
+
+      try {
+        await downloadAssetWithProgress(item.asset, controller.signal, (loaded, total) => {
+          setBatchDownload((current) =>
+            current
+              ? {
+                  ...current,
+                  currentLoaded: loaded,
+                  currentTotal: total
+                }
+              : current
+          );
+        });
+        completed += 1;
+      } catch {
+        if (controller.signal.aborted) {
+          break;
+        }
+        failed += 1;
+      }
+
+      setBatchDownload((current) =>
+        current
+          ? {
+              ...current,
+              completed,
+              failed
+            }
+          : current
+      );
+
+      if (!controller.signal.aborted) {
+        await waitForNextDownload(controller.signal, 250);
+      }
+    }
+
+    const wasCancelled = controller.signal.aborted;
+    if (batchDownloadAbortRef.current === controller) {
+      batchDownloadAbortRef.current = null;
+    }
+    setBatchDownload(null);
+
+    if (wasCancelled) {
+      showStatus(t("galleryBatchDownloadCancelled", { completed, total: queue.length }));
+      return;
+    }
+
+    if (failed > 0) {
+      setError(t("galleryBatchDownloadFinishedWithErrors", { completed, failed, total: queue.length }));
+      return;
+    }
+
+    showStatus(t("galleryBatchDownloadFinished", { count: completed }));
+  }
+
+  function cancelBatchDownload(): void {
+    batchDownloadAbortRef.current?.abort();
   }
 
   function toggleSelectedItem(item: GalleryImageItem): void {
@@ -373,12 +479,12 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
 
         <GalleryBulkToolbar
           allFilteredItemsSelected={allFilteredItemsSelected}
-          disabled={isDeleting}
+          disabled={isDeleting || isBatchDownloading}
           filteredCount={filteredItems.length}
           selectedCount={selectedOutputIds.size}
           onClearSelection={clearSelection}
           onDeleteSelected={() => setPendingBatchDelete(true)}
-          onDownloadSelected={downloadSelectedItems}
+          onDownloadSelected={() => void downloadSelectedItems()}
           onSelectFiltered={selectFilteredItems}
         />
 
@@ -394,6 +500,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
             <p>{statusMessage}</p>
           </div>
         ) : null}
+        {batchDownload ? <GalleryBatchDownloadProgress batchDownload={batchDownload} onCancel={cancelBatchDownload} /> : null}
 
         {isLoading ? (
           <div className="gallery-empty-state" data-testid="gallery-loading" role="status">
@@ -517,6 +624,55 @@ function GalleryBulkToolbar({
           {disabled ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <Trash2 className="size-4" aria-hidden="true" />}
           {t("galleryBatchDelete")}
         </button>
+      </div>
+    </section>
+  );
+}
+
+function GalleryBatchDownloadProgress({
+  batchDownload,
+  onCancel
+}: {
+  batchDownload: BatchDownloadState;
+  onCancel: () => void;
+}) {
+  const { t } = useI18n();
+  const currentPercent = batchDownload.currentTotal
+    ? Math.min(100, Math.round((batchDownload.currentLoaded / batchDownload.currentTotal) * 100))
+    : null;
+  const currentFraction = batchDownload.currentTotal ? Math.min(1, batchDownload.currentLoaded / batchDownload.currentTotal) : 0;
+  const overallPercent = Math.min(100, Math.round(((batchDownload.completed + currentFraction) / batchDownload.total) * 100));
+
+  return (
+    <section className="gallery-download-progress" data-testid="gallery-download-progress" role="status" aria-live="polite">
+      <div className="gallery-download-progress__header">
+        <div>
+          <p>{t("galleryBatchDownloadProgressTitle", { completed: batchDownload.completed, total: batchDownload.total })}</p>
+          <span>
+            {batchDownload.currentFileName
+              ? t("galleryBatchDownloadCurrent", { fileName: batchDownload.currentFileName })
+              : t("galleryBatchDownloadPreparing")}
+          </span>
+        </div>
+        <button className="secondary-action h-9" type="button" onClick={onCancel}>
+          {t("galleryBatchDownloadCancel")}
+        </button>
+      </div>
+      <div className="gallery-download-progress__bar" aria-label={t("galleryBatchDownloadOverall", { percent: overallPercent })}>
+        <span style={{ width: `${overallPercent}%` }} />
+      </div>
+      <div className="gallery-download-progress__meta">
+        <span>{t("galleryBatchDownloadOverall", { percent: overallPercent })}</span>
+        <span>
+          {currentPercent === null
+            ? t("galleryBatchDownloadLoaded", { loaded: formatFileSize(batchDownload.currentLoaded) })
+            : t("galleryBatchDownloadCurrentBytes", {
+                loaded: formatFileSize(batchDownload.currentLoaded),
+                percent: currentPercent,
+                total: formatFileSize(batchDownload.currentTotal ?? 0)
+              })}
+        </span>
+        {batchDownload.failed > 0 ? <span>{t("galleryBatchDownloadFailedCount", { count: batchDownload.failed })}</span> : null}
       </div>
     </section>
   );
@@ -993,15 +1149,112 @@ function DeleteGalleryBatchDialog({
   );
 }
 
-function triggerAssetDownload(item: GalleryImageItem): void {
+function triggerAssetDownload(asset: GeneratedAsset): void {
+  triggerDownloadLink(`/api/assets/${encodeURIComponent(asset.id)}/download`, asset.fileName);
+}
+
+async function downloadAssetWithProgress(asset: GeneratedAsset, signal: AbortSignal, onProgress: (loaded: number, total: number | null) => void): Promise<void> {
+  const response = await fetch(`/api/assets/${encodeURIComponent(asset.id)}/download`, { signal });
+  if (!response.ok) {
+    throw new Error(`Download failed with status ${response.status}.`);
+  }
+
+  const total = parseContentLength(response.headers.get("Content-Length"));
+  const contentType = response.headers.get("Content-Type") ?? asset.mimeType;
+  const fileName = responseDownloadFileName(response.headers.get("Content-Disposition"), asset.fileName);
+
+  if (!response.body) {
+    const blob = await response.blob();
+    onProgress(blob.size, total ?? blob.size);
+    triggerBlobDownload(blob, fileName);
+    return;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: BlobPart[] = [];
+  let loaded = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    const chunk = new Uint8Array(value.byteLength);
+    chunk.set(value);
+    chunks.push(chunk);
+    loaded += value.byteLength;
+    onProgress(loaded, total);
+  }
+
+  triggerBlobDownload(new Blob(chunks, { type: contentType }), fileName);
+}
+
+function triggerBlobDownload(blob: Blob, fileName: string): void {
+  const url = URL.createObjectURL(blob);
+  triggerDownloadLink(url, fileName);
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function triggerDownloadLink(href: string, fileName: string): void {
   const link = document.createElement("a");
-  link.href = `/api/assets/${encodeURIComponent(item.asset.id)}/download`;
-  link.rel = "noopener noreferrer";
-  link.target = "_blank";
+  link.download = fileName;
+  link.href = href;
   link.style.display = "none";
   document.body.append(link);
   link.click();
   link.remove();
+}
+
+function parseContentLength(value: string | null): number | null {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function responseDownloadFileName(contentDisposition: string | null, fallback: string): string {
+  if (!contentDisposition) {
+    return fallback;
+  }
+
+  const match = /filename="?([^";]+)"?/iu.exec(contentDisposition);
+  return match?.[1] ? match[1] : fallback;
+}
+
+function waitForNextDownload(signal: AbortSignal, delayMs: number): Promise<void> {
+  if (signal.aborted) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const timeoutId = window.setTimeout(resolve, delayMs);
+    signal.addEventListener(
+      "abort",
+      () => {
+        window.clearTimeout(timeoutId);
+        resolve();
+      },
+      { once: true }
+    );
+  });
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
 }
 
 function assetPreviewUrl(assetId: string, width: number): string {
