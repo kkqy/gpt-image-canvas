@@ -1,5 +1,6 @@
 import { desc, eq, inArray } from "drizzle-orm";
 import { isAbsolute, relative, resolve } from "node:path";
+import { deleteStoredAssetPreviews } from "./asset-preview.js";
 import { LocalAssetStorageAdapter } from "./asset-storage.js";
 import type {
   GeneratedAsset,
@@ -148,6 +149,7 @@ export async function deleteGalleryOutput(outputId: string): Promise<boolean> {
   const shouldDeleteAsset = asset ? !isAssetUsedByAnotherGalleryOutput(asset.id, outputId) : false;
   if (asset && shouldDeleteAsset) {
     await deleteLocalAssetFile(asset);
+    await deleteStoredAssetPreviews(asset.id);
   }
 
   const result = db.delete(generationOutputs).where(eq(generationOutputs.id, outputId)).run();

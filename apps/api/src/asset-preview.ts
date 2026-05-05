@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import sharp from "sharp";
 import { readStoredAsset } from "./image-generation.js";
@@ -89,6 +89,10 @@ export async function readStoredAssetPreview(assetId: string, width: number): Pr
     bytes,
     width
   };
+}
+
+export async function deleteStoredAssetPreviews(assetId: string): Promise<void> {
+  await Promise.all(PREVIEW_WIDTHS.map((width) => rm(resolvePreviewPath(assetId, width), { force: true })));
 }
 
 async function readCachedPreview(filePath: string): Promise<Buffer | undefined> {

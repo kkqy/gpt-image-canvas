@@ -54,6 +54,14 @@ interface BatchDownloadState {
   currentTotal: number | null;
 }
 
+interface BatchDeleteState {
+  isActive: boolean;
+  total: number;
+  completed: number;
+  failed: number;
+  currentFileName: string;
+}
+
 export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   const { locale, t } = useI18n();
   const [items, setItems] = useState<GalleryImageItem[]>([]);
@@ -68,8 +76,10 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   const [pendingBatchDelete, setPendingBatchDelete] = useState(false);
   const [deletingOutputIds, setDeletingOutputIds] = useState<Set<string>>(() => new Set());
   const [batchDownload, setBatchDownload] = useState<BatchDownloadState | null>(null);
+  const [batchDelete, setBatchDelete] = useState<BatchDeleteState | null>(null);
   const statusTimerRef = useRef<number | undefined>();
   const batchDownloadAbortRef = useRef<AbortController | null>(null);
+  const batchDeleteAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -146,6 +156,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
     return () => {
       window.clearTimeout(statusTimerRef.current);
       batchDownloadAbortRef.current?.abort();
+      batchDeleteAbortRef.current?.abort();
     };
   }, []);
 
@@ -184,6 +195,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   const allFilteredItemsSelected = filteredItems.length > 0 && filteredItems.every((item) => selectedOutputIds.has(item.outputId));
   const isDeleting = deletingOutputIds.size > 0;
   const isBatchDownloading = batchDownload?.isActive ?? false;
+  const isBatchDeleting = batchDelete?.isActive ?? false;
   const actionHandlers: GalleryActionHandlers = {
     onCopy: (item) => void copyPrompt(item),
     onDelete: requestDelete,
@@ -292,7 +304,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
       );
 
       if (!controller.signal.aborted) {
-        await waitForNextDownload(controller.signal, 250);
+        await waitForNextQueueItem(controller.signal, 250);
       }
     }
 
@@ -346,11 +358,19 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   }
 
   function requestDelete(item: GalleryImageItem): void {
+    if (isDeleting) {
+      return;
+    }
+
     setError("");
     setPendingDeleteItem(item);
   }
 
   async function deleteItem(item: GalleryImageItem): Promise<void> {
+    if (isDeleting) {
+      return;
+    }
+
     setDeletingOutputIds(new Set([item.outputId]));
     setError("");
 
@@ -383,73 +403,118 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   }
 
   async function deleteSelectedItems(): Promise<void> {
-    const outputIds = selectedItems.map((item) => item.outputId);
-    if (outputIds.length === 0) {
+    if (selectedItems.length === 0 || isBatchDeleting) {
       return;
     }
 
-    setDeletingOutputIds(new Set(outputIds));
-    setError("");
+    const queue = [...selectedItems];
+    const controller = new AbortController();
+    batchDeleteAbortRef.current = controller;
+    let completed = 0;
+    let failed = 0;
 
-    const deletedItems: DeletedGalleryItem[] = [];
-    let firstError: Error | undefined;
-    try {
-      const results = await Promise.all(
-        selectedItems.map(async (item) => {
-          try {
-            const outputId = item.outputId;
-            const response = await fetch(`/api/gallery/${encodeURIComponent(outputId)}`, {
-              method: "DELETE"
-            });
-            if (!response.ok) {
-              throw new Error(await readGalleryError(response, locale, t));
+    setPendingBatchDelete(false);
+    window.clearTimeout(statusTimerRef.current);
+    setDeletingOutputIds(new Set(queue.map((item) => item.outputId)));
+    setError("");
+    setStatusMessage("");
+    setBatchDelete({
+      completed,
+      currentFileName: "",
+      failed,
+      isActive: true,
+      total: queue.length
+    });
+
+    for (const item of queue) {
+      if (controller.signal.aborted) {
+        break;
+      }
+
+      setBatchDelete((current) =>
+        current
+          ? {
+              ...current,
+              currentFileName: item.asset.fileName
             }
-            return { assetId: item.asset.id, outputId };
-          } catch (deleteError) {
-            return {
-              error: deleteError instanceof Error ? deleteError : new Error(t("galleryBatchDeleteFailed")),
-              assetId: item.asset.id,
-              outputId: item.outputId
-            };
-          }
-        })
+          : current
       );
 
-      for (const result of results) {
-        if (result.error) {
-          firstError ??= result.error;
-        } else {
-          deletedItems.push({ assetId: result.assetId, outputId: result.outputId });
-        }
-      }
-    } catch {
-      firstError = new Error(t("galleryBatchDeleteFailed"));
-    } finally {
-      if (deletedItems.length > 0) {
-        const deletedOutputIds = deletedItems.map((item) => item.outputId);
-        const deletedSet = new Set(deletedOutputIds);
-        setItems((current) => current.filter((galleryItem) => !deletedSet.has(galleryItem.outputId)));
-        setSelectedOutputIds((current) => {
-          const next = new Set(current);
-          for (const outputId of deletedSet) {
-            next.delete(outputId);
-          }
-          return next;
+      try {
+        const response = await fetch(`/api/gallery/${encodeURIComponent(item.outputId)}`, {
+          method: "DELETE",
+          signal: controller.signal
         });
-        setSelectedItem((current) => (current && deletedSet.has(current.outputId) ? null : current));
-        onDeleted(deletedItems);
-        if (!firstError) {
-          showStatus(t("galleryBatchDeleted", { count: deletedOutputIds.length }));
+        if (!response.ok) {
+          throw new Error(await readGalleryError(response, locale, t));
         }
+
+        completed += 1;
+        applyDeletedGalleryItems([{ assetId: item.asset.id, outputId: item.outputId }]);
+      } catch {
+        if (controller.signal.aborted) {
+          break;
+        }
+        failed += 1;
       }
 
-      if (firstError) {
-        setError(firstError.message);
-      }
+      setDeletingOutputIds((current) => {
+        const next = new Set(current);
+        next.delete(item.outputId);
+        return next;
+      });
+      setBatchDelete((current) =>
+        current
+          ? {
+              ...current,
+              completed,
+              failed
+            }
+          : current
+      );
 
-      setPendingBatchDelete(false);
-      setDeletingOutputIds(new Set());
+      if (!controller.signal.aborted) {
+        await waitForNextQueueItem(controller.signal, 120);
+      }
     }
+
+    const wasCancelled = controller.signal.aborted;
+    if (batchDeleteAbortRef.current === controller) {
+      batchDeleteAbortRef.current = null;
+    }
+    setDeletingOutputIds(new Set());
+    setBatchDelete(null);
+
+    if (wasCancelled) {
+      showStatus(t("galleryBatchDeleteCancelled", { completed, total: queue.length }));
+      return;
+    }
+
+    if (failed > 0) {
+      setError(t("galleryBatchDeleteFinishedWithErrors", { completed, failed, total: queue.length }));
+      return;
+    }
+
+    showStatus(t("galleryBatchDeleted", { count: completed }));
+  }
+
+  function cancelBatchDelete(): void {
+    batchDeleteAbortRef.current?.abort();
+  }
+
+  function applyDeletedGalleryItems(deletedItems: DeletedGalleryItem[]): void {
+    const deletedOutputIds = deletedItems.map((item) => item.outputId);
+    const deletedSet = new Set(deletedOutputIds);
+    setItems((current) => current.filter((galleryItem) => !deletedSet.has(galleryItem.outputId)));
+    setSelectedOutputIds((current) => {
+      const next = new Set(current);
+      for (const outputId of deletedSet) {
+        next.delete(outputId);
+      }
+      return next;
+    });
+    setSelectedItem((current) => (current && deletedSet.has(current.outputId) ? null : current));
+    onDeleted(deletedItems);
   }
 
   return (
@@ -485,7 +550,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
 
         <GalleryBulkToolbar
           allFilteredItemsSelected={allFilteredItemsSelected}
-          disabled={isDeleting || isBatchDownloading}
+          disabled={isDeleting || isBatchDownloading || isBatchDeleting}
           filteredCount={filteredItems.length}
           selectedCount={selectedOutputIds.size}
           onClearSelection={clearSelection}
@@ -507,6 +572,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
           </div>
         ) : null}
         {batchDownload ? <GalleryBatchDownloadProgress batchDownload={batchDownload} onCancel={cancelBatchDownload} /> : null}
+        {batchDelete ? <GalleryBatchDeleteProgress batchDelete={batchDelete} onCancel={cancelBatchDelete} /> : null}
 
         {isLoading ? (
           <div className="gallery-empty-state" data-testid="gallery-loading" role="status">
@@ -679,6 +745,44 @@ function GalleryBatchDownloadProgress({
               })}
         </span>
         {batchDownload.failed > 0 ? <span>{t("galleryBatchDownloadFailedCount", { count: batchDownload.failed })}</span> : null}
+      </div>
+    </section>
+  );
+}
+
+function GalleryBatchDeleteProgress({
+  batchDelete,
+  onCancel
+}: {
+  batchDelete: BatchDeleteState;
+  onCancel: () => void;
+}) {
+  const { t } = useI18n();
+  const processedCount = batchDelete.completed + batchDelete.failed;
+  const overallPercent = Math.min(100, Math.round((processedCount / batchDelete.total) * 100));
+
+  return (
+    <section className="gallery-download-progress gallery-download-progress--delete" data-testid="gallery-delete-progress" role="status" aria-live="polite">
+      <div className="gallery-download-progress__header">
+        <div>
+          <p>{t("galleryBatchDeleteProgressTitle", { completed: batchDelete.completed, total: batchDelete.total })}</p>
+          <span>
+            {batchDelete.currentFileName
+              ? t("galleryBatchDeleteCurrent", { fileName: batchDelete.currentFileName })
+              : t("galleryBatchDeletePreparing")}
+          </span>
+        </div>
+        <button className="secondary-action h-9" type="button" onClick={onCancel}>
+          {t("galleryBatchDeleteCancel")}
+        </button>
+      </div>
+      <div className="gallery-download-progress__bar" aria-label={t("galleryBatchDeleteOverall", { percent: overallPercent })}>
+        <span style={{ width: `${overallPercent}%` }} />
+      </div>
+      <div className="gallery-download-progress__meta">
+        <span>{t("galleryBatchDeleteOverall", { percent: overallPercent })}</span>
+        <span>{t("galleryBatchDeleteProcessed", { count: processedCount, total: batchDelete.total })}</span>
+        {batchDelete.failed > 0 ? <span>{t("galleryBatchDeleteFailedCount", { count: batchDelete.failed })}</span> : null}
       </div>
     </section>
   );
@@ -1230,7 +1334,7 @@ function responseDownloadFileName(contentDisposition: string | null, fallback: s
   return match?.[1] ? match[1] : fallback;
 }
 
-function waitForNextDownload(signal: AbortSignal, delayMs: number): Promise<void> {
+function waitForNextQueueItem(signal: AbortSignal, delayMs: number): Promise<void> {
   if (signal.aborted) {
     return Promise.resolve();
   }
