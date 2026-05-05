@@ -249,6 +249,11 @@ interface CanvasImageLayoutItem {
   y: number;
 }
 
+interface DeletedGalleryItem {
+  outputId: string;
+  assetId: string;
+}
+
 interface StorageConfigFormState {
   enabled: boolean;
   secretId: string;
@@ -1471,6 +1476,38 @@ function findCanvasImageShape(editor: Editor, record: GenerationRecord): TLShape
   }
 
   return undefined;
+}
+
+function removeCanvasImagesForLocalAssets(editor: Editor | null, assetIds: Set<string>): number {
+  for (const assetId of assetIds) {
+    assetMetadataCache.delete(assetId);
+    assetMetadataRequests.delete(assetId);
+    initialCanvasPreviewWidths.delete(assetId);
+  }
+
+  if (!editor || assetIds.size === 0) {
+    return 0;
+  }
+
+  const shapeIds: TLShapeId[] = [];
+  for (const shape of editor.getCurrentPageShapes()) {
+    if (!isImageShape(shape)) {
+      continue;
+    }
+
+    const asset = shape.props.assetId ? editor.getAsset(shape.props.assetId) : undefined;
+    const sourceUrl = getImageSourceUrl(shape, asset);
+    const localAssetId = getLocalAssetId(asset, sourceUrl);
+    if (localAssetId && assetIds.has(localAssetId)) {
+      shapeIds.push(shape.id);
+    }
+  }
+
+  if (shapeIds.length > 0) {
+    editor.deleteShapes(shapeIds);
+  }
+
+  return shapeIds.length;
 }
 
 function fileNameWithImageExtension(name: string, mimeType: string): string {
@@ -3177,10 +3214,14 @@ export function App() {
     }
   }
 
-  function removeGalleryOutputFromHistory(outputId: string): void {
+  function removeGalleryOutputFromHistory(deletedItems: DeletedGalleryItem[]): void {
+    const deletedOutputIds = new Set(deletedItems.map((item) => item.outputId));
+    const deletedAssetIds = new Set(deletedItems.map((item) => item.assetId));
+
+    removeCanvasImagesForLocalAssets(editorRef.current, deletedAssetIds);
     setGenerationHistory((history) =>
       history.flatMap((record) => {
-        const nextOutputs = record.outputs.filter((output) => output.id !== outputId);
+        const nextOutputs = record.outputs.filter((output) => !deletedOutputIds.has(output.id));
         if (nextOutputs.length === record.outputs.length) {
           return [record];
         }

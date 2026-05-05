@@ -28,8 +28,13 @@ import {
 import { localizedApiErrorMessage, useI18n, type Locale, type Translate } from "./i18n";
 
 interface GalleryPageProps {
-  onDeleted: (outputId: string) => void;
+  onDeleted: (items: DeletedGalleryItem[]) => void;
   onReuse: (item: GalleryImageItem) => void;
+}
+
+interface DeletedGalleryItem {
+  outputId: string;
+  assetId: string;
 }
 
 interface GalleryActionHandlers {
@@ -368,7 +373,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
       });
       setSelectedItem((current) => (current?.outputId === item.outputId ? null : current));
       setPendingDeleteItem(null);
-      onDeleted(item.outputId);
+      onDeleted([{ assetId: item.asset.id, outputId: item.outputId }]);
       showStatus(t("galleryDeleted"));
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : t("galleryDeleteFailed"));
@@ -386,23 +391,25 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
     setDeletingOutputIds(new Set(outputIds));
     setError("");
 
-    const deletedOutputIds: string[] = [];
+    const deletedItems: DeletedGalleryItem[] = [];
     let firstError: Error | undefined;
     try {
       const results = await Promise.all(
-        outputIds.map(async (outputId) => {
+        selectedItems.map(async (item) => {
           try {
+            const outputId = item.outputId;
             const response = await fetch(`/api/gallery/${encodeURIComponent(outputId)}`, {
               method: "DELETE"
             });
             if (!response.ok) {
               throw new Error(await readGalleryError(response, locale, t));
             }
-            return { outputId };
+            return { assetId: item.asset.id, outputId };
           } catch (deleteError) {
             return {
               error: deleteError instanceof Error ? deleteError : new Error(t("galleryBatchDeleteFailed")),
-              outputId
+              assetId: item.asset.id,
+              outputId: item.outputId
             };
           }
         })
@@ -412,13 +419,14 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
         if (result.error) {
           firstError ??= result.error;
         } else {
-          deletedOutputIds.push(result.outputId);
+          deletedItems.push({ assetId: result.assetId, outputId: result.outputId });
         }
       }
     } catch {
       firstError = new Error(t("galleryBatchDeleteFailed"));
     } finally {
-      if (deletedOutputIds.length > 0) {
+      if (deletedItems.length > 0) {
+        const deletedOutputIds = deletedItems.map((item) => item.outputId);
         const deletedSet = new Set(deletedOutputIds);
         setItems((current) => current.filter((galleryItem) => !deletedSet.has(galleryItem.outputId)));
         setSelectedOutputIds((current) => {
@@ -429,9 +437,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
           return next;
         });
         setSelectedItem((current) => (current && deletedSet.has(current.outputId) ? null : current));
-        for (const outputId of deletedOutputIds) {
-          onDeleted(outputId);
-        }
+        onDeleted(deletedItems);
         if (!firstError) {
           showStatus(t("galleryBatchDeleted", { count: deletedOutputIds.length }));
         }
