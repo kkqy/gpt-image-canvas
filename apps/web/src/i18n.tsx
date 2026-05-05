@@ -231,14 +231,14 @@ const zhMessages = {
   galleryBatchDelete: "删除选中",
   galleryBatchDeleted: ({ count }: { count: number }) => `已删除 ${count} 张选中图片。`,
   galleryBatchDeleteBody: ({ count }: { count: number }) =>
-    `将从 Gallery 和生成历史移除 ${count} 张选中图片。画布中的图片、本地文件和资产记录会保留。`,
+    `将从 Gallery 和生成历史移除 ${count} 张选中图片，并删除对应本地文件和资产记录。云端备份不会删除。`,
   galleryBatchDeleteFailed: "部分图片删除失败，请重试。",
   galleryBatchDeleteTitle: ({ count }: { count: number }) => `删除 ${count} 张 Gallery 图片？`,
   galleryBatchDownload: "下载选中",
   galleryBatchDownloadStarted: ({ count }: { count: number }) => `已开始下载 ${count} 张图片。`,
   galleryClearSelection: "清空选择",
   galleryConfirmDeleteBody: ({ excerpt }: { excerpt: string }) =>
-    `将从 Gallery 和生成历史移除“${excerpt}”。画布中的图片、本地文件和资产记录会保留。`,
+    `将从 Gallery 和生成历史移除“${excerpt}”，并删除对应本地文件和资产记录。云端备份不会删除。`,
   galleryConfirmRemove: "确认移除",
   galleryConfirmDeleteTitle: "移除这张 Gallery 图片？",
   galleryCopiedPrompt: "已复制提示词。",
@@ -555,14 +555,14 @@ const enMessages: I18nMessages = {
   galleryBatchDelete: "Delete selected",
   galleryBatchDeleted: ({ count }) => `Deleted ${count} selected images.`,
   galleryBatchDeleteBody: ({ count }) =>
-    `Remove ${count} selected images from Gallery and generation history. Images on the canvas, local files, and asset records will be kept.`,
+    `Remove ${count} selected images from Gallery and generation history, and delete their local files and asset records. Cloud backups will not be deleted.`,
   galleryBatchDeleteFailed: "Some images could not be deleted. Try again.",
   galleryBatchDeleteTitle: ({ count }) => `Delete ${count} Gallery images?`,
   galleryBatchDownload: "Download selected",
   galleryBatchDownloadStarted: ({ count }) => `Started downloading ${count} images.`,
   galleryClearSelection: "Clear selection",
   galleryConfirmDeleteBody: ({ excerpt }) =>
-    `Remove "${excerpt}" from Gallery and generation history. Images on the canvas, local files, and asset records will be kept.`,
+    `Remove "${excerpt}" from Gallery and generation history, and delete its local file and asset record. Cloud backups will not be deleted.`,
   galleryConfirmRemove: "Remove",
   galleryConfirmDeleteTitle: "Remove this Gallery image?",
   galleryCopiedPrompt: "Prompt copied.",

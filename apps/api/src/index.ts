@@ -190,8 +190,8 @@ app.get("/api/project", (c) => c.json(getProjectState()));
 
 app.get("/api/gallery", (c) => c.json(getGalleryImages()));
 
-app.delete("/api/gallery/:outputId", (c) => {
-  const deleted = deleteGalleryOutput(c.req.param("outputId"));
+app.delete("/api/gallery/:outputId", async (c) => {
+  const deleted = await deleteGalleryOutput(c.req.param("outputId"));
   if (!deleted) {
     return c.json(errorResponse("not_found", "找不到请求的 Gallery 图片记录。"), 404);
   }

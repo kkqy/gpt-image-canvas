@@ -1,4 +1,6 @@
 import { desc, eq, inArray } from "drizzle-orm";
+import { isAbsolute, relative, resolve } from "node:path";
+import { LocalAssetStorageAdapter } from "./asset-storage.js";
 import type {
   GeneratedAsset,
   GalleryImageItem,
@@ -12,11 +14,13 @@ import type {
   ProjectState
 } from "./contracts.js";
 import { db } from "./database.js";
+import { runtimePaths } from "./runtime.js";
 import { assets, generationOutputs, generationRecords, generationReferenceAssets, projects } from "./schema.js";
 
 export const DEFAULT_PROJECT_ID = "default";
 const DEFAULT_PROJECT_NAME = "Default Project";
 const fallbackWarnings = new Set<string>();
+const localAssetStorage = new LocalAssetStorageAdapter();
 
 export interface AssetPromptMetadata {
   prompt: string;
@@ -134,9 +138,56 @@ export function getGalleryImages(): GalleryResponse {
   };
 }
 
-export function deleteGalleryOutput(outputId: string): boolean {
+export async function deleteGalleryOutput(outputId: string): Promise<boolean> {
+  const output = db.select().from(generationOutputs).where(eq(generationOutputs.id, outputId)).get();
+  if (!output) {
+    return false;
+  }
+
+  const asset = output.assetId ? db.select().from(assets).where(eq(assets.id, output.assetId)).get() : undefined;
+  const shouldDeleteAsset = asset ? !isAssetUsedByAnotherGalleryOutput(asset.id, outputId) : false;
+  if (asset && shouldDeleteAsset) {
+    await deleteLocalAssetFile(asset);
+  }
+
   const result = db.delete(generationOutputs).where(eq(generationOutputs.id, outputId)).run();
-  return result.changes > 0;
+  if (result.changes === 0) {
+    return false;
+  }
+
+  if (asset && shouldDeleteAsset) {
+    db.delete(generationReferenceAssets).where(eq(generationReferenceAssets.assetId, asset.id)).run();
+    db.update(generationRecords)
+      .set({ referenceAssetId: null })
+      .where(eq(generationRecords.referenceAssetId, asset.id))
+      .run();
+    db.delete(assets).where(eq(assets.id, asset.id)).run();
+  }
+
+  return true;
+}
+
+function isAssetUsedByAnotherGalleryOutput(assetId: string, outputId: string): boolean {
+  return db
+    .select({ id: generationOutputs.id })
+    .from(generationOutputs)
+    .where(eq(generationOutputs.assetId, assetId))
+    .all()
+    .some((output) => output.id !== outputId);
+}
+
+async function deleteLocalAssetFile(asset: typeof assets.$inferSelect): Promise<void> {
+  const filePath = resolve(runtimePaths.dataDir, asset.relativePath);
+  if (!isInsideDirectory(filePath, runtimePaths.assetsDir)) {
+    return;
+  }
+
+  await localAssetStorage.deleteObject({ filePath });
+}
+
+function isInsideDirectory(filePath: string, directory: string): boolean {
+  const localPath = relative(directory, filePath);
+  return Boolean(localPath) && !localPath.startsWith("..") && !isAbsolute(localPath);
 }
 
 export function getAssetPromptMetadata(assetId: string): AssetPromptMetadata | undefined {
