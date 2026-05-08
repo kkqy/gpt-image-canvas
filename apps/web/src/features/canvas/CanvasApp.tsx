@@ -380,7 +380,7 @@ interface AgentOutputPlacementLayout {
 }
 
 interface ActiveGenerationPlaceholders {
-  requestId: number;
+  requestId: number | string;
   placements: GenerationPlaceholderPlacement[];
 }
 
@@ -403,6 +403,14 @@ interface ActiveGenerationTask {
 interface DeletedGalleryItem {
   outputId: string;
   assetId: string;
+}
+
+interface CanvasImageLayoutItem {
+  shape: TLImageShape;
+  width: number;
+  height: number;
+  x: number;
+  y: number;
 }
 
 interface StorageConfigFormState {
@@ -633,6 +641,16 @@ function isLoadingGenerationPlaceholderRecord(value: unknown): boolean {
   );
 }
 
+function isRestorableGenerationPlaceholderRecord(value: unknown): boolean {
+  return (
+    isLoadingGenerationPlaceholderRecord(value) &&
+    isRecord(value) &&
+    isRecord(value.props) &&
+    typeof value.props.requestId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.props.requestId)
+  );
+}
+
 function isAgentPlanNodeSnapshotRecord(value: unknown): value is Record<string, unknown> {
   return isRecord(value) && value.typeName === "shape" && value.type === AGENT_PLAN_NODE_TYPE;
 }
@@ -645,7 +663,7 @@ function filterLoadingPlaceholdersFromStoreSnapshot<TSnapshot>(snapshot: TSnapsh
   let changed = false;
   const nextStore: Record<string, unknown> = {};
   for (const [id, record] of Object.entries(snapshot.store)) {
-    if (isLoadingGenerationPlaceholderRecord(record)) {
+    if (isLoadingGenerationPlaceholderRecord(record) && !isRestorableGenerationPlaceholderRecord(record)) {
       changed = true;
       continue;
     }
@@ -846,7 +864,7 @@ function createCenteredPlacements(editor: Editor, countValue: GenerationCount, s
 function createGenerationPlaceholdersFromPlacements(
   editor: Editor,
   placements: GenerationPlaceholderPlacement[],
-  requestId: number,
+  requestId: number | string,
   options: { selectPlaceholders?: boolean } = {}
 ): ActiveGenerationPlaceholders {
   const placeholderIds = placements.map((placement) => placement.id);
@@ -883,7 +901,7 @@ function createGenerationPlaceholdersFromPlacements(
 function createGenerationPlaceholders(
   editor: Editor,
   input: GenerationSubmitInput,
-  requestId: number,
+  requestId: number | string,
   options: { selectPlaceholders?: boolean } = {}
 ): ActiveGenerationPlaceholders {
   return createGenerationPlaceholdersFromPlacements(editor, createCenteredPlacements(editor, input.count, input.size), requestId, options);
@@ -963,6 +981,10 @@ function agentOutputPlacement(
 
 function isGenerationPlaceholderShape(shape: unknown): shape is GenerationPlaceholderShape {
   return isRecord(shape) && shape.type === GENERATION_PLACEHOLDER_TYPE;
+}
+
+function isImageShape(shape: unknown): shape is TLImageShape {
+  return isRecord(shape) && shape.type === "image";
 }
 
 function livePlacement(editor: Editor, placement: GenerationPlaceholderPlacement): GenerationPlaceholderPlacement {
@@ -1180,6 +1202,139 @@ function hasLoadingGenerationPlaceholders(editor: Editor, placeholderSet: Active
 
 function firstLiveGenerationPlaceholder(editor: Editor, placeholderSet: ActiveGenerationPlaceholders): TLShapeId | undefined {
   return placeholderSet.placements.find((placement) => isGenerationPlaceholderShape(editor.getShape(placement.id)))?.id;
+}
+
+function placeholderSetForGeneration(
+  editor: Editor,
+  generationId: string,
+  requestId: number
+): ActiveGenerationPlaceholders | undefined {
+  const placements = editor
+    .getCurrentPageShapes()
+    .filter(isGenerationPlaceholderShape)
+    .filter((shape) => shape.props.requestId === generationId)
+    .sort((left, right) => left.props.outputIndex - right.props.outputIndex)
+    .map((shape) => ({
+      id: shape.id,
+      x: shape.x,
+      y: shape.y,
+      width: shape.props.w,
+      height: shape.props.h,
+      targetWidth: shape.props.targetWidth,
+      targetHeight: shape.props.targetHeight
+    }));
+
+  return placements.length > 0 ? { requestId, placements } : undefined;
+}
+
+function failedGenerationPlaceholderIds(editor: Editor): TLShapeId[] {
+  return editor
+    .getCurrentPageShapes()
+    .filter(isGenerationPlaceholderShape)
+    .filter((shape) => shape.props.status === "failed")
+    .map((shape) => shape.id);
+}
+
+function selectedOrAllCanvasImageShapes(editor: Editor): TLImageShape[] {
+  const selectedImageShapes = editor.getSelectedShapes().filter(isImageShape);
+  return selectedImageShapes.length > 0 ? selectedImageShapes : editor.getCurrentPageShapes().filter(isImageShape);
+}
+
+function canvasImageLayoutItems(editor: Editor, imageShapes: TLImageShape[]): CanvasImageLayoutItem[] {
+  return imageShapes
+    .flatMap((shape) => {
+      const bounds = editor.getShapePageBounds(shape.id);
+      if (!bounds) {
+        return [];
+      }
+
+      return [
+        {
+          shape,
+          width: bounds.w,
+          height: bounds.h,
+          x: bounds.x,
+          y: bounds.y
+        }
+      ];
+    })
+    .sort((left, right) => left.y - right.y || left.x - right.x);
+}
+
+function matrixScoreForCanvasImages(items: CanvasImageLayoutItem[], columns: number, gap: number): number {
+  const rows = Math.ceil(items.length / columns);
+  const columnWidths = Array.from({ length: columns }, (_, column) =>
+    Math.max(...items.filter((_, index) => index % columns === column).map((item) => item.width), 0)
+  );
+  const rowHeights = Array.from({ length: rows }, (_, row) =>
+    Math.max(...items.filter((_, index) => Math.floor(index / columns) === row).map((item) => item.height), 0)
+  );
+  const gridWidth = columnWidths.reduce((total, value) => total + value, 0) + Math.max(0, columns - 1) * gap;
+  const gridHeight = rowHeights.reduce((total, value) => total + value, 0) + Math.max(0, rows - 1) * gap;
+
+  if (gridWidth <= 0 || gridHeight <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.abs(Math.log(gridWidth / gridHeight));
+}
+
+function bestCanvasImageColumnCount(items: CanvasImageLayoutItem[], gap: number): number {
+  let bestColumns = 1;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (let columns = 1; columns <= items.length; columns += 1) {
+    const score = matrixScoreForCanvasImages(items, columns, gap);
+    if (score < bestScore) {
+      bestColumns = columns;
+      bestScore = score;
+    }
+  }
+
+  return bestColumns;
+}
+
+function arrangeCanvasImageShapes(editor: Editor, imageShapes: TLImageShape[]): number {
+  const items = canvasImageLayoutItems(editor, imageShapes);
+  if (items.length === 0) {
+    return 0;
+  }
+
+  const gap = 48;
+  const columns = bestCanvasImageColumnCount(items, gap);
+  const rows = Math.ceil(items.length / columns);
+  const columnWidths = Array.from({ length: columns }, (_, column) =>
+    Math.max(...items.filter((_, index) => index % columns === column).map((item) => item.width), 0)
+  );
+  const rowHeights = Array.from({ length: rows }, (_, row) =>
+    Math.max(...items.filter((_, index) => Math.floor(index / columns) === row).map((item) => item.height), 0)
+  );
+  const gridWidth = columnWidths.reduce((total, value) => total + value, 0) + Math.max(0, columns - 1) * gap;
+  const gridHeight = rowHeights.reduce((total, value) => total + value, 0) + Math.max(0, rows - 1) * gap;
+  const boundsLeft = Math.min(...items.map((item) => item.x));
+  const boundsTop = Math.min(...items.map((item) => item.y));
+  const boundsRight = Math.max(...items.map((item) => item.x + item.width));
+  const boundsBottom = Math.max(...items.map((item) => item.y + item.height));
+  const originX = (boundsLeft + boundsRight) / 2 - gridWidth / 2;
+  const originY = (boundsTop + boundsBottom) / 2 - gridHeight / 2;
+  const columnOffsets = columnWidths.map((_, column) => columnWidths.slice(0, column).reduce((total, value) => total + value, 0) + column * gap);
+  const rowOffsets = rowHeights.map((_, row) => rowHeights.slice(0, row).reduce((total, value) => total + value, 0) + row * gap);
+
+  editor.updateShapes<TLImageShape>(
+    items.map((item, index) => {
+      const column = index % columns;
+      const row = Math.floor(index / columns);
+      return {
+        id: item.shape.id,
+        type: "image",
+        x: originX + columnOffsets[column] + (columnWidths[column] - item.width) / 2,
+        y: originY + rowOffsets[row] + (rowHeights[row] - item.height) / 2
+      } satisfies TLShapePartial<TLImageShape>;
+    })
+  );
+
+  editor.select(...items.map((item) => item.shape.id));
+  return items.length;
 }
 
 function resolveReferenceSelection(editor: Editor, t: Translate): ReferenceSelection {
@@ -2504,6 +2659,7 @@ export function App() {
   const [generationMessage, setGenerationMessage] = useState("");
   const [generationWarning, setGenerationWarning] = useState("");
   const [generationHistory, setGenerationHistory] = useState<GenerationRecord[]>([]);
+  const [editorMountVersion, setEditorMountVersion] = useState(0);
   const [isHistoryExpanded, setIsHistoryExpanded] = useState(false);
   const [isMobileDrawer, setIsMobileDrawer] = useState(false);
   const [isAiPanelOpen, setIsAiPanelOpen] = useState(false);
@@ -2547,6 +2703,7 @@ export function App() {
   const editorRef = useRef<Editor | null>(null);
   const generationModeRef = useRef<GenerationMode>("text");
   const activeGenerationsRef = useRef<Map<number, ActiveGenerationTask>>(new Map());
+  const restoredGenerationIdsRef = useRef<Set<string>>(new Set());
   const generationRequestRef = useRef(0);
   const agentRequestRef = useRef(0);
   const agentSocketRef = useRef<WebSocket | null>(null);
@@ -3229,6 +3386,7 @@ export function App() {
 
   const handleEditorMount = useCallback((editor: Editor) => {
     editorRef.current = editor;
+    setEditorMountVersion((version) => version + 1);
     if (!editor.user.getIsSnapMode()) {
       editor.user.updateUserPreferences({ isSnapMode: true });
     }
@@ -3395,6 +3553,145 @@ export function App() {
     }
   }
 
+  function finishActiveGeneration(requestId: number): void {
+    if (activeGenerationsRef.current.delete(requestId)) {
+      setActiveGenerationCount(activeGenerationsRef.current.size);
+    }
+  }
+
+  async function applyCompletedGenerationRecord(requestId: number, record: GenerationRecord): Promise<void> {
+    const task = activeGenerationsRef.current.get(requestId);
+    if (!task) {
+      return;
+    }
+
+    const editor = editorRef.current;
+    if (record.status === "cancelled") {
+      if (editor) {
+        deleteLoadingGenerationPlaceholders(editor, task.placeholderSet);
+      }
+      setGenerationHistory((history) =>
+        [record, ...history.filter((item) => item.id !== task.temporaryRecordId && item.id !== record.id)].slice(0, 20)
+      );
+      setGenerationError("");
+      setGenerationMessage(record.error ?? t("generationUnknownCancel"));
+      setGenerationWarning("");
+      finishActiveGeneration(requestId);
+      return;
+    }
+
+    if (!editor) {
+      setGenerationHistory((history) =>
+        [record, ...history.filter((item) => item.id !== task.temporaryRecordId && item.id !== record.id)].slice(0, 20)
+      );
+      finishActiveGeneration(requestId);
+      return;
+    }
+
+    await preloadGenerationRecordPreviews(record, task.controller.signal);
+    if (task.controller.signal.aborted || !activeGenerationsRef.current.has(requestId)) {
+      return;
+    }
+
+    setGenerationHistory((history) =>
+      [record, ...history.filter((item) => item.id !== task.temporaryRecordId && item.id !== record.id)].slice(0, 20)
+    );
+    const insertedCount = replaceGenerationPlaceholders(editor, task.placeholderSet, record, t);
+    const failedCount =
+      record.outputs.filter((output) => output.status === "failed").length +
+      Math.max(0, task.placeholderSet.placements.length - record.outputs.length);
+    const cloudFailedCount = cloudFailureCount(record);
+    if (insertedCount > 0) {
+      if (cloudFailedCount > 0 || failedCount > 0) {
+        setGenerationWarning(generationWarningMessage(record, insertedCount, failedCount, cloudFailedCount, t));
+      } else {
+        setGenerationMessage(t("generationImageInserted", { count: insertedCount }));
+      }
+      showGenerationCompleteNotification(record, insertedCount, failedCount, t);
+    } else {
+      setGenerationError(generationFailureMessage(record, t));
+    }
+    finishActiveGeneration(requestId);
+  }
+
+  function restoreCompletedGenerationRecord(requestId: number, record: GenerationRecord): void {
+    void applyCompletedGenerationRecord(requestId, record).catch((error) => {
+      const task = activeGenerationsRef.current.get(requestId);
+      const message = error instanceof Error ? error.message : t("generationErrorDefault");
+      const editor = editorRef.current;
+      if (editor && task) {
+        markGenerationPlaceholdersFailed(editor, task.placeholderSet, message);
+      }
+      setGenerationError(message);
+      finishActiveGeneration(requestId);
+    });
+  }
+
+  function restorePendingGenerationRecord(requestId: number, generationId: string): void {
+    void (async () => {
+      while (true) {
+        const task = activeGenerationsRef.current.get(requestId);
+        if (!task || task.controller.signal.aborted) {
+          return;
+        }
+
+        try {
+          const record = await pollGenerationRecord(requestId, generationId);
+          await applyCompletedGenerationRecord(requestId, record);
+          return;
+        } catch (error) {
+          if (task.controller.signal.aborted || !activeGenerationsRef.current.has(requestId)) {
+            return;
+          }
+          await waitForGenerationPoll(task.controller.signal, 2400).catch(() => undefined);
+        }
+      }
+    })();
+  }
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!isProjectLoaded || !editor || editorMountVersion === 0) {
+      return;
+    }
+
+    for (const record of generationHistory) {
+      if (restoredGenerationIdsRef.current.has(record.id)) {
+        continue;
+      }
+      if (
+        Array.from(activeGenerationsRef.current.values()).some(
+          (task) => task.serverGenerationId === record.id || task.temporaryRecordId === record.id
+        )
+      ) {
+        restoredGenerationIdsRef.current.add(record.id);
+        continue;
+      }
+
+      const requestId = generationRequestRef.current + 1;
+      const placeholderSet = placeholderSetForGeneration(editor, record.id, requestId);
+      if (!placeholderSet) {
+        continue;
+      }
+
+      generationRequestRef.current = requestId;
+      activeGenerationsRef.current.set(requestId, {
+        requestId,
+        temporaryRecordId: record.id,
+        controller: new AbortController(),
+        placeholderSet,
+        serverGenerationId: record.id
+      });
+      restoredGenerationIdsRef.current.add(record.id);
+      setActiveGenerationCount(activeGenerationsRef.current.size);
+      if (isPendingGenerationRecord(record)) {
+        restorePendingGenerationRecord(requestId, record.id);
+      } else {
+        restoreCompletedGenerationRecord(requestId, record);
+      }
+    }
+  }, [editorMountVersion, generationHistory, isProjectLoaded]);
+
   async function executeGeneration(
     input: GenerationSubmitInput,
     requestMode: GenerationMode,
@@ -3423,7 +3720,7 @@ export function App() {
     const requestId = generationRequestRef.current + 1;
     const serverGenerationId = crypto.randomUUID();
     generationRequestRef.current = requestId;
-    const placeholderSet = createGenerationPlaceholders(editor, input, requestId, {
+    const placeholderSet = createGenerationPlaceholders(editor, input, serverGenerationId, {
       selectPlaceholders: requestMode !== "reference"
     });
     const temporaryRecord = createTemporaryGenerationRecord({
@@ -3493,29 +3790,7 @@ export function App() {
       const completedRecord = isPendingGenerationRecord(body.record)
         ? await pollGenerationRecord(requestId, body.record.id)
         : body.record;
-      await preloadGenerationRecordPreviews(completedRecord, controller.signal);
-      if (controller.signal.aborted || !activeGenerationsRef.current.has(requestId)) {
-        return;
-      }
-
-      setGenerationHistory((history) =>
-        [completedRecord, ...history.filter((record) => record.id !== temporaryRecord.id && record.id !== completedRecord.id)].slice(0, 20)
-      );
-      const insertedCount = replaceGenerationPlaceholders(editor, placeholderSet, completedRecord, t);
-      const failedCount =
-        completedRecord.outputs.filter((output) => output.status === "failed").length +
-        Math.max(0, placeholderSet.placements.length - completedRecord.outputs.length);
-      const cloudFailedCount = cloudFailureCount(completedRecord);
-      if (insertedCount > 0) {
-        if (cloudFailedCount > 0 || failedCount > 0) {
-          setGenerationWarning(generationWarningMessage(completedRecord, insertedCount, failedCount, cloudFailedCount, t));
-        } else {
-          setGenerationMessage(t("generationImageInserted", { count: insertedCount }));
-        }
-        showGenerationCompleteNotification(completedRecord, insertedCount, failedCount, t);
-      } else {
-        setGenerationError(generationFailureMessage(completedRecord, t));
-      }
+      await applyCompletedGenerationRecord(requestId, completedRecord);
     } catch (error) {
       if (controller.signal.aborted || !activeGenerationsRef.current.has(requestId)) {
         return;
@@ -3528,9 +3803,7 @@ export function App() {
       );
       setGenerationError(message);
     } finally {
-      if (activeGenerationsRef.current.delete(requestId)) {
-        setActiveGenerationCount(activeGenerationsRef.current.size);
-      }
+      finishActiveGeneration(requestId);
     }
   }
 
@@ -3590,7 +3863,9 @@ export function App() {
 
     const shapeId = findCanvasImageShape(editor, record);
     if (!shapeId) {
-      const activeTask = Array.from(activeGenerationsRef.current.values()).find((task) => task.temporaryRecordId === record.id);
+      const activeTask = Array.from(activeGenerationsRef.current.values()).find(
+        (task) => task.temporaryRecordId === record.id || task.serverGenerationId === record.id
+      );
       const placeholderId = activeTask ? firstLiveGenerationPlaceholder(editor, activeTask.placeholderSet) : undefined;
       if (!placeholderId) {
         setGenerationError(t("generationHistoryImageMissing"));
@@ -3697,6 +3972,47 @@ export function App() {
     }
   }
 
+  function cleanFailedCanvasGenerations(): void {
+    setGenerationError("");
+    setGenerationMessage("");
+    setGenerationWarning("");
+
+    const editor = editorRef.current;
+    if (!editor) {
+      setGenerationError(t("generationCanvasNotReady"));
+      return;
+    }
+
+    const failedPlaceholderIds = failedGenerationPlaceholderIds(editor);
+    if (failedPlaceholderIds.length === 0) {
+      setGenerationMessage(t("canvasCleanupNoFailed"));
+      return;
+    }
+
+    editor.deleteShapes(failedPlaceholderIds);
+    setGenerationMessage(t("canvasCleanupSucceeded", { count: failedPlaceholderIds.length }));
+  }
+
+  function arrangeSelectedOrAllCanvasImages(): void {
+    setGenerationError("");
+    setGenerationMessage("");
+    setGenerationWarning("");
+
+    const editor = editorRef.current;
+    if (!editor) {
+      setGenerationError(t("generationCanvasNotReady"));
+      return;
+    }
+
+    const arrangedCount = arrangeCanvasImageShapes(editor, selectedOrAllCanvasImageShapes(editor));
+    if (arrangedCount === 0) {
+      setGenerationMessage(t("canvasArrangeNoImages"));
+      return;
+    }
+
+    setGenerationMessage(t("canvasArrangeSucceeded", { count: arrangedCount }));
+  }
+
   function removeGalleryItemsFromCanvas(deletedItems: DeletedGalleryItem[]): number {
     const deletedAssetIds = new Set(deletedItems.map((item) => item.assetId));
     for (const assetId of deletedAssetIds) {
@@ -3798,6 +4114,20 @@ export function App() {
           ? (cancelledRecord ?? { ...record, status: "cancelled", error: t("generationUnknownCancel") })
           : record
       )
+    );
+    setGenerationError("");
+    setGenerationMessage(t("generationUnknownCancel"));
+    setGenerationWarning("");
+  }
+
+  async function cancelHistoryGeneration(record: GenerationRecord): Promise<void> {
+    if (!isPendingGenerationRecord(record)) {
+      return;
+    }
+
+    const cancelledRecord = await cancelServerGeneration(record.id).catch(() => undefined);
+    setGenerationHistory((history) =>
+      history.map((item) => (item.id === record.id ? (cancelledRecord ?? { ...item, status: "cancelled", error: t("generationUnknownCancel") }) : item))
     );
     setGenerationError("");
     setGenerationMessage(t("generationUnknownCancel"));
@@ -5065,6 +5395,16 @@ export function App() {
             </div>
           </div>
         )}
+        <div className="canvas-quick-actions" aria-label={t("canvasQuickActionsAria")} data-testid="canvas-quick-actions">
+          <button className="canvas-quick-actions__button" type="button" onClick={cleanFailedCanvasGenerations}>
+            <XCircle className="size-4" aria-hidden="true" />
+            {t("canvasCleanupFailed")}
+          </button>
+          <button className="canvas-quick-actions__button" type="button" onClick={arrangeSelectedOrAllCanvasImages}>
+            <Square className="size-4" aria-hidden="true" />
+            {t("canvasArrangeImages")}
+          </button>
+        </div>
       </section>
 
       {isMobileDrawer && isAiPanelOpen ? (
@@ -5510,8 +5850,10 @@ export function App() {
                   const downloadableAsset = firstDownloadableAsset(record);
                   const excerpt = promptExcerpt(record.prompt);
                   const totalOutputs = record.outputs.length || record.count;
-                  const activeTask = Array.from(activeGenerationsRef.current.values()).find((task) => task.temporaryRecordId === record.id);
-                  const isRecordRunning = record.status === "running" && Boolean(activeTask);
+                  const activeTask = Array.from(activeGenerationsRef.current.values()).find(
+                    (task) => task.temporaryRecordId === record.id || task.serverGenerationId === record.id
+                  );
+                  const isRecordRunning = isPendingGenerationRecord(record);
                   const cloudFailedCount = cloudFailureCount(record);
                   const cloudFailureMessage = firstCloudFailureMessage(record);
 
@@ -5592,14 +5934,14 @@ export function App() {
                         >
                           <RotateCcw className="size-4" aria-hidden="true" />
                         </button>
-                        {activeTask && record.status === "running" ? (
+                        {isRecordRunning ? (
                           <button
                             aria-label={t("historyCancelTask", { excerpt })}
                             className="history-icon-action"
                             type="button"
                             data-testid="history-cancel"
                             title={t("commonCancel")}
-                            onClick={() => cancelGeneration(activeTask.requestId)}
+                            onClick={() => (activeTask ? cancelGeneration(activeTask.requestId) : cancelHistoryGeneration(record))}
                           >
                             <XCircle className="size-4" aria-hidden="true" />
                           </button>

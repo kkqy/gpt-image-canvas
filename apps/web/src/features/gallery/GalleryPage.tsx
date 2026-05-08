@@ -1295,12 +1295,12 @@ function DeleteGalleryBatchDialog({
   const { t } = useI18n();
 
   return (
-    <div className="gallery-confirm-backdrop" data-testid="gallery-batch-delete-dialog" role="presentation">
+    <div className="gallery-confirm-backdrop app-modal-backdrop" data-testid="gallery-batch-delete-dialog" role="presentation">
       <div
         aria-describedby="gallery-batch-delete-description"
         aria-labelledby="gallery-batch-delete-title"
         aria-modal="true"
-        className="gallery-confirm"
+        className="gallery-confirm app-modal-surface"
         role="dialog"
       >
         <div className="gallery-confirm__icon">

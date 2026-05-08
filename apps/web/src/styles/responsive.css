@@ -3,6 +3,19 @@
     --mobile-drawer-width: min(430px, calc(100vw - 28px));
   }
 
+  .canvas-quick-actions {
+    top: 0.75rem;
+    left: 0.75rem;
+    max-width: calc(100% - 1.5rem);
+    transform: none;
+  }
+
+  .canvas-quick-actions__button {
+    height: 2rem;
+    font-size: 0.75rem;
+    padding: 0 0.62rem;
+  }
+
   .ai-panel {
     box-shadow: -20px 0 60px rgb(21 17 13 / 0.24);
   }
@@ -98,6 +111,32 @@
 
   .gallery-search {
     height: 2.55rem;
+  }
+
+  .gallery-bulk-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .gallery-bulk-toolbar__actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    justify-content: stretch;
+  }
+
+  .gallery-bulk-toolbar__actions .secondary-action,
+  .gallery-bulk-toolbar__actions .danger-action {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .gallery-download-progress__header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .gallery-download-progress__header span {
+    max-width: 100%;
   }
 
   .gallery-feature__footer {
