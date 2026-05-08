@@ -141,6 +141,7 @@ export async function completeTextGenerationRecord(
     async (position) => {
       const output = await generateSingleOutput(input, provider, signal, position);
       persistGenerationOutput(generationId, output);
+      reconcileGenerationRecordIfComplete(generationId);
       return output;
     }
   );
@@ -160,6 +161,7 @@ export async function completeReferenceGenerationRecord(
     async (position) => {
       const output = await editSingleOutput(input, provider, signal, position);
       persistGenerationOutput(generationId, output);
+      reconcileGenerationRecordIfComplete(generationId);
       return output;
     }
   );
@@ -668,6 +670,31 @@ function persistGenerationOutput(generationId: string, output: BatchOutputResult
       createdAt
     })
     .onConflictDoNothing()
+    .run();
+}
+
+function reconcileGenerationRecordIfComplete(generationId: string): void {
+  const record = db.select().from(generationRecords).where(eq(generationRecords.id, generationId)).get();
+  if (!record || (record.status !== "running" && record.status !== "pending")) {
+    return;
+  }
+
+  const outputs = db.select().from(generationOutputs).where(eq(generationOutputs.generationId, generationId)).all();
+  if (outputs.length < record.count) {
+    return;
+  }
+
+  const successCount = outputs.filter((output) => output.status === "succeeded").length;
+  const failureCount = outputs.length - successCount;
+  const status = resolveGenerationStatus(successCount, failureCount);
+  const error = failureCount > 0 ? `${failureCount} 张图像生成失败。` : undefined;
+
+  db.update(generationRecords)
+    .set({
+      status,
+      error: error ?? null
+    })
+    .where(eq(generationRecords.id, generationId))
     .run();
 }
 

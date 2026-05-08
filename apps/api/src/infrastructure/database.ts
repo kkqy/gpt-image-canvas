@@ -187,6 +187,7 @@ ensureColumn("agent_llm_configs", "model", "model TEXT NOT NULL DEFAULT ''");
 ensureColumn("agent_llm_configs", "timeout_ms", "timeout_ms INTEGER NOT NULL DEFAULT 60000");
 ensureColumn("agent_llm_configs", "supports_vision", "supports_vision INTEGER NOT NULL DEFAULT 0");
 ensureColumn("generation_outputs", "position", "position INTEGER NOT NULL DEFAULT 0");
+backfillGenerationOutputPositions();
 
 backfillGenerationReferenceAssets();
 ensureProviderConfigRow();
@@ -205,6 +206,30 @@ function ensureColumn(tableName: string, columnName: string, definition: string)
   }
 
   sqlite.exec(`ALTER TABLE ${tableName} ADD COLUMN ${definition}`);
+}
+
+function backfillGenerationOutputPositions(): void {
+  sqlite.exec(`
+    WITH ranked_outputs AS (
+      SELECT
+        id,
+        ROW_NUMBER() OVER (PARTITION BY generation_id ORDER BY created_at, id) - 1 AS next_position
+      FROM generation_outputs
+      WHERE generation_id IN (
+        SELECT generation_id
+        FROM generation_outputs
+        GROUP BY generation_id
+        HAVING COUNT(*) > 1 AND COUNT(DISTINCT position) <= 1
+      )
+    )
+    UPDATE generation_outputs
+    SET position = (
+      SELECT ranked_outputs.next_position
+      FROM ranked_outputs
+      WHERE ranked_outputs.id = generation_outputs.id
+    )
+    WHERE id IN (SELECT id FROM ranked_outputs);
+  `);
 }
 
 function backfillGenerationReferenceAssets(): void {

@@ -116,6 +116,9 @@ Manual text generation and reference generation use bounded parallel requests.
 - Completed outputs are persisted while the generation record is still `running`, using `generation_outputs.position` to preserve placeholder order.
 - Canvas polling should replace each completed output's placeholder incrementally; it must not wait for the whole batch to finish before showing any generated image.
 - Gallery may show completed outputs from a still-running generation; Canvas should stay in sync with those completed outputs on the next poll.
+- If a running generation already has at least `count` persisted outputs, `/api/generations/:id` must reconcile the generation status to `succeeded`, `partial`, or `failed` instead of leaving it stuck as `running`.
+- Startup stale-running cleanup must preserve completed or partially completed outputs: complete output sets should become final records, partial output sets should become `partial`, and only empty interrupted records should become `failed`.
+- Existing `generation_outputs` rows created before `position` existed must be backfilled by creation order so Canvas can map outputs to placeholders deterministically.
 
 Important paths:
 

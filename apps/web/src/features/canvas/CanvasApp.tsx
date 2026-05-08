@@ -1295,6 +1295,20 @@ function generationOutputPosition(output: GenerationOutput, fallbackIndex: numbe
   return Number.isInteger(output.position) && output.position !== undefined && output.position >= 0 ? output.position : fallbackIndex;
 }
 
+function placementForGenerationOutput(
+  editor: Editor,
+  placeholderSet: ActiveGenerationPlaceholders,
+  position: number,
+  fallbackIndex: number
+): GenerationPlaceholderPlacement | undefined {
+  const preferredPlacement = placeholderSet.placements[position];
+  if (preferredPlacement && isGenerationPlaceholderShape(editor.getShape(preferredPlacement.id))) {
+    return preferredPlacement;
+  }
+
+  return placeholderSet.placements[fallbackIndex] ?? preferredPlacement;
+}
+
 function applyGenerationOutputsToPlaceholders(
   editor: Editor,
   placeholderSet: ActiveGenerationPlaceholders,
@@ -1317,28 +1331,40 @@ function applyGenerationOutputsToPlaceholders(
       return;
     }
 
-    const placement = placeholderSet.placements[position];
-    if (!placement) {
-      newlyAppliedOutputIds.push(output.id);
-      return;
-    }
-
-    const placeholder = editor.getShape(placement.id);
-    if (!isGenerationPlaceholderShape(placeholder)) {
-      newlyAppliedOutputIds.push(output.id);
-      return;
-    }
-
     if (output.status === "succeeded" && output.asset) {
+      if (findCanvasImageShapeByAssetId(editor, output.asset.id)) {
+        newlyAppliedOutputIds.push(output.id);
+        return;
+      }
+
+      const placement = placementForGenerationOutput(editor, placeholderSet, position, fallbackIndex);
+      if (!placement) {
+        return;
+      }
+
       const resolvedPlacement = livePlacement(editor, placement);
       assets.push(createImageAsset(output.asset));
       imageShapes.push(createImageShape(output.asset, resolvedPlacement, record.prompt));
-      replacedPlaceholderIds.push(placement.id);
+      if (isGenerationPlaceholderShape(editor.getShape(placement.id))) {
+        replacedPlaceholderIds.push(placement.id);
+      }
       newlyAppliedOutputIds.push(output.id);
       return;
     }
 
     if (output.status === "failed") {
+      const placement = placementForGenerationOutput(editor, placeholderSet, position, fallbackIndex);
+      if (!placement) {
+        newlyAppliedOutputIds.push(output.id);
+        return;
+      }
+
+      const placeholder = editor.getShape(placement.id);
+      if (!isGenerationPlaceholderShape(placeholder)) {
+        newlyAppliedOutputIds.push(output.id);
+        return;
+      }
+
       failedUpdates.push({
         id: placement.id,
         type: GENERATION_PLACEHOLDER_TYPE,
@@ -6226,7 +6252,7 @@ export function App() {
                 {visibleHistory.map((record) => {
                   const downloadableAsset = firstDownloadableAsset(record);
                   const excerpt = promptExcerpt(record.prompt);
-                  const totalOutputs = record.outputs.length || record.count;
+                  const totalOutputs = record.count;
                   const activeTask = Array.from(activeGenerationsRef.current.values()).find(
                     (task) => task.temporaryRecordId === record.id || task.serverGenerationId === record.id
                   );

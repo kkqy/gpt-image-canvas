@@ -205,22 +205,21 @@ export function getAssetPromptMetadata(assetId: string): AssetPromptMetadata | u
 }
 
 export function getGenerationRecord(generationId: string): ApiGenerationRecord | undefined {
-  const record = db.select().from(generationRecords).where(eq(generationRecords.id, generationId)).get();
+  let record = db.select().from(generationRecords).where(eq(generationRecords.id, generationId)).get();
   if (!record) {
     return undefined;
   }
+
+  record = reconcileRunningGenerationRecord(record, { completeOnly: true });
 
   return mapGenerationRecordRows([record])[0];
 }
 
 export function markStaleRunningGenerationsFailed(message: string): void {
-  db.update(generationRecords)
-    .set({
-      status: "failed",
-      error: message
-    })
-    .where(eq(generationRecords.status, "running"))
-    .run();
+  const records = db.select().from(generationRecords).where(eq(generationRecords.status, "running")).all();
+  for (const record of records) {
+    reconcileRunningGenerationRecord(record, { completeOnly: false, interruptedMessage: message });
+  }
 }
 
 function getDefaultProjectRow(): (typeof projects.$inferSelect) | undefined {
@@ -273,6 +272,54 @@ function formatErrorSummary(error: unknown): string {
   }
 
   return String(error);
+}
+
+function reconcileRunningGenerationRecord(
+  record: typeof generationRecords.$inferSelect,
+  options: { completeOnly: boolean; interruptedMessage?: string }
+): typeof generationRecords.$inferSelect {
+  if (record.status !== "running" && record.status !== "pending") {
+    return record;
+  }
+
+  const outputs = db.select().from(generationOutputs).where(eq(generationOutputs.generationId, record.id)).all();
+  if (options.completeOnly && outputs.length < record.count) {
+    return record;
+  }
+
+  const successCount = outputs.filter((output) => output.status === "succeeded").length;
+  const failureCount = outputs.length - successCount;
+  const hasCompleteOutputSet = outputs.length >= record.count;
+  const nextStatus = hasCompleteOutputSet
+    ? generationStatusForOutputCounts(successCount, failureCount)
+    : successCount > 0
+      ? "partial"
+      : "failed";
+  const nextError = hasCompleteOutputSet && failureCount > 0 ? `${failureCount} 张图像生成失败。` : options.interruptedMessage;
+
+  db.update(generationRecords)
+    .set({
+      status: nextStatus,
+      error: nextError ?? null
+    })
+    .where(eq(generationRecords.id, record.id))
+    .run();
+
+  return {
+    ...record,
+    error: nextError ?? null,
+    status: nextStatus
+  };
+}
+
+function generationStatusForOutputCounts(successCount: number, failureCount: number): GenerationStatus {
+  if (successCount > 0 && failureCount > 0) {
+    return "partial";
+  }
+  if (successCount > 0) {
+    return "succeeded";
+  }
+  return "failed";
 }
 
 function readGenerationHistory(): ApiGenerationRecord[] {
