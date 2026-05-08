@@ -263,6 +263,7 @@
 
 .gallery-feature {
   display: grid;
+  position: relative;
   grid-template-columns: minmax(0, 1.25fr) minmax(20rem, 0.75fr);
   gap: clamp(1rem, 2vw, 1.4rem);
   align-items: stretch;
@@ -479,6 +480,7 @@
 
 .gallery-card {
   display: flex;
+  position: relative;
   width: 100%;
   min-width: 0;
   flex-direction: column;

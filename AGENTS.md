@@ -7,6 +7,7 @@
 - Root scripts delegate to workspace packages: `pnpm dev`, `pnpm api:dev`, `pnpm web:dev`, `pnpm typecheck`, `pnpm build`, and `pnpm start`.
 - For browser verification, run `pnpm dev` and open the Vite web app, usually `http://localhost:5173`.
 - Documentation map for higher-quality agent work:
+  - Read `docs/LOCAL_DELTA.md` before merging or rebasing from upstream; it lists local features that must not be dropped during conflict resolution.
   - Read `docs/PRODUCT_SENSE.md` before changing product behavior, onboarding, Gallery, provider configuration, or Agent workflows.
   - Read `docs/DESIGN.md` and `docs/FRONTEND.md` before UI work in `apps/web`; read `docs/design-docs/interaction-quality.md` for UI polish and micro-interaction work.
   - Read `docs/PLANS.md` before writing product specs, exec plans, Ralph PRDs, or multi-story task breakdowns.

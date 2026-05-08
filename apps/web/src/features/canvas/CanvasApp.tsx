@@ -692,6 +692,188 @@ function filterLoadingPlaceholdersFromSnapshot<TSnapshot>(snapshot: TSnapshot): 
   return filterLoadingPlaceholdersFromStoreSnapshot(snapshot);
 }
 
+function localAssetIdFromUrl(sourceUrl: string | undefined): string | undefined {
+  if (!sourceUrl) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(sourceUrl, window.location.origin);
+    if (url.origin === window.location.origin) {
+      const match = /^\/api\/assets\/([^/?#]+)(?:\/(?:download|preview))?$/u.exec(url.pathname);
+      return match?.[1];
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+}
+
+function snapshotAssetRecordLocalId(record: unknown, fallbackId: string): string | undefined {
+  if (!isRecord(record) || record.typeName !== "asset") {
+    return undefined;
+  }
+
+  const metaLocalId = isRecord(record.meta) && typeof record.meta.localAssetId === "string" ? record.meta.localAssetId : undefined;
+  if (metaLocalId) {
+    return metaLocalId;
+  }
+
+  const recordId = typeof record.id === "string" ? record.id : fallbackId;
+  if (recordId.startsWith("asset:")) {
+    return recordId.slice("asset:".length);
+  }
+
+  const sourceUrl = isRecord(record.props) && typeof record.props.src === "string" ? record.props.src : undefined;
+  return localAssetIdFromUrl(sourceUrl);
+}
+
+function snapshotAssetRecordSourceUrl(record: unknown): string | undefined {
+  return isRecord(record) && isRecord(record.props) && typeof record.props.src === "string" ? record.props.src : undefined;
+}
+
+function isSnapshotImageShapeRecord(record: unknown): boolean {
+  return isRecord(record) && record.typeName === "shape" && record.type === "image" && isRecord(record.props);
+}
+
+function localAssetIdForSnapshotImageShape(
+  record: unknown,
+  assetLocalIds: Map<string, string>,
+  assetSourceUrls: Map<string, string>
+): string | undefined {
+  if (!isSnapshotImageShapeRecord(record) || !isRecord(record) || !isRecord(record.props)) {
+    return undefined;
+  }
+
+  const shapeAssetId = typeof record.props.assetId === "string" ? record.props.assetId : undefined;
+  if (shapeAssetId) {
+    const mappedLocalId = assetLocalIds.get(shapeAssetId);
+    if (mappedLocalId) {
+      return mappedLocalId;
+    }
+    if (shapeAssetId.startsWith("asset:")) {
+      return shapeAssetId.slice("asset:".length);
+    }
+  }
+
+  const shapeUrl = typeof record.props.url === "string" ? record.props.url : undefined;
+  const shapeUrlLocalId = localAssetIdFromUrl(shapeUrl);
+  if (shapeUrlLocalId) {
+    return shapeUrlLocalId;
+  }
+
+  return shapeAssetId ? localAssetIdFromUrl(assetSourceUrls.get(shapeAssetId)) : undefined;
+}
+
+function snapshotGalleryAssetMaps(snapshot: unknown): {
+  assetLocalIds: Map<string, string>;
+  assetSourceUrls: Map<string, string>;
+} {
+  const assetLocalIds = new Map<string, string>();
+  const assetSourceUrls = new Map<string, string>();
+  if (!isRecord(snapshot) || !isRecord(snapshot.store)) {
+    return { assetLocalIds, assetSourceUrls };
+  }
+
+  for (const [id, record] of Object.entries(snapshot.store)) {
+    const recordId = isRecord(record) && typeof record.id === "string" ? record.id : id;
+    const localAssetId = snapshotAssetRecordLocalId(record, recordId);
+    if (localAssetId) {
+      assetLocalIds.set(recordId, localAssetId);
+      assetLocalIds.set(id, localAssetId);
+    }
+
+    const sourceUrl = snapshotAssetRecordSourceUrl(record);
+    if (sourceUrl) {
+      assetSourceUrls.set(recordId, sourceUrl);
+      assetSourceUrls.set(id, sourceUrl);
+    }
+  }
+
+  return { assetLocalIds, assetSourceUrls };
+}
+
+function galleryImageShapeIdsFromStoreSnapshot(snapshot: unknown, deletedAssetIds: Set<string>): TLShapeId[] {
+  if (!isRecord(snapshot) || !isRecord(snapshot.store) || deletedAssetIds.size === 0) {
+    return [];
+  }
+
+  const { assetLocalIds, assetSourceUrls } = snapshotGalleryAssetMaps(snapshot);
+  return Object.entries(snapshot.store).flatMap(([id, record]) => {
+    const localAssetId = localAssetIdForSnapshotImageShape(record, assetLocalIds, assetSourceUrls);
+    if (!localAssetId || !deletedAssetIds.has(localAssetId)) {
+      return [];
+    }
+
+    const shapeId = isRecord(record) && typeof record.id === "string" ? record.id : id;
+    return [shapeId as TLShapeId];
+  });
+}
+
+function galleryImageShapeIdsFromSnapshot(snapshot: unknown, deletedAssetIds: Set<string>): TLShapeId[] {
+  if (!isRecord(snapshot)) {
+    return [];
+  }
+
+  if (isRecord(snapshot.document)) {
+    return galleryImageShapeIdsFromStoreSnapshot(snapshot.document, deletedAssetIds);
+  }
+
+  return galleryImageShapeIdsFromStoreSnapshot(snapshot, deletedAssetIds);
+}
+
+function removeGalleryAssetsFromStoreSnapshot<TSnapshot>(
+  snapshot: TSnapshot,
+  deletedAssetIds: Set<string>
+): { changed: boolean; removedShapeCount: number; snapshot: TSnapshot } {
+  if (!isRecord(snapshot) || !isRecord(snapshot.store) || deletedAssetIds.size === 0) {
+    return { changed: false, removedShapeCount: 0, snapshot };
+  }
+
+  const { assetLocalIds, assetSourceUrls } = snapshotGalleryAssetMaps(snapshot);
+  let changed = false;
+  let removedShapeCount = 0;
+  const nextStore: Record<string, unknown> = {};
+
+  for (const [id, record] of Object.entries(snapshot.store)) {
+    const localAssetId = localAssetIdForSnapshotImageShape(record, assetLocalIds, assetSourceUrls);
+    if (localAssetId && deletedAssetIds.has(localAssetId)) {
+      changed = true;
+      removedShapeCount += 1;
+      continue;
+    }
+
+    const assetLocalId = snapshotAssetRecordLocalId(record, id);
+    if (assetLocalId && deletedAssetIds.has(assetLocalId)) {
+      changed = true;
+      continue;
+    }
+
+    nextStore[id] = record;
+  }
+
+  return changed ? { changed, removedShapeCount, snapshot: { ...snapshot, store: nextStore } as TSnapshot } : { changed, removedShapeCount, snapshot };
+}
+
+function removeGalleryAssetsFromSnapshot<TSnapshot>(
+  snapshot: TSnapshot,
+  deletedAssetIds: Set<string>
+): { changed: boolean; removedShapeCount: number; snapshot: TSnapshot } {
+  if (!isRecord(snapshot)) {
+    return { changed: false, removedShapeCount: 0, snapshot };
+  }
+
+  if (isRecord(snapshot.document)) {
+    const result = removeGalleryAssetsFromStoreSnapshot(snapshot.document, deletedAssetIds);
+    return result.changed
+      ? { changed: true, removedShapeCount: result.removedShapeCount, snapshot: { ...snapshot, document: result.snapshot } as TSnapshot }
+      : { changed: false, removedShapeCount: 0, snapshot };
+  }
+
+  return removeGalleryAssetsFromStoreSnapshot(snapshot, deletedAssetIds);
+}
+
 function coerceStylePresetId(value: string): StylePresetId {
   return STYLE_PRESETS.some((preset) => preset.id === value) ? (value as StylePresetId) : "none";
 }
@@ -2720,6 +2902,7 @@ export function App() {
   const pendingAgentSelectedReferencesRef = useRef<Map<string, AgentSelectedCanvasReference[]>>(new Map());
   const agentPlanSelectedReferencesRef = useRef<Map<string, AgentSelectedCanvasReference[]>>(new Map());
   const pendingAgentOutputReferencesRef = useRef<Map<string, RecentAgentOutputReference[]>>(new Map());
+  const pendingGalleryDeletedAssetIdsRef = useRef<Set<string>>(new Set());
   const recentSuccessfulAgentOutputReferencesRef = useRef<RecentAgentOutputReference[]>([]);
   const agentPlaceholderRequestRef = useRef(0);
   const agentCopyResetTimerRef = useRef<number | undefined>();
@@ -3470,6 +3653,9 @@ export function App() {
     });
     editor.on("change", updateReferenceSelection);
     deleteAgentPlanNodes(editor);
+    if (pendingGalleryDeletedAssetIdsRef.current.size > 0) {
+      cleanupGalleryDeletedAssets(new Set(pendingGalleryDeletedAssetIdsRef.current));
+    }
     commitReferenceSelection();
 
     return () => {
@@ -4013,8 +4199,39 @@ export function App() {
     setGenerationMessage(t("canvasArrangeSucceeded", { count: arrangedCount }));
   }
 
-  function removeGalleryItemsFromCanvas(deletedItems: DeletedGalleryItem[]): number {
-    const deletedAssetIds = new Set(deletedItems.map((item) => item.assetId));
+  async function persistProjectSnapshot(snapshot: PersistedSnapshot): Promise<void> {
+    const requestId = saveRequestRef.current + 1;
+    saveRequestRef.current = requestId;
+    setSaveStatus("saving");
+    setSaveError("");
+
+    try {
+      const response = await fetch("/api/project", {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          snapshot: filterLoadingPlaceholdersFromSnapshot(snapshot)
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Project save failed with ${response.status}`);
+      }
+
+      if (saveRequestRef.current === requestId) {
+        setSaveStatus("saved");
+      }
+    } catch {
+      if (saveRequestRef.current === requestId) {
+        setSaveStatus("error");
+        setSaveError(t("autosaveFailed"));
+      }
+    }
+  }
+
+  function cleanupGalleryDeletedAssets(deletedAssetIds: Set<string>): number {
     for (const assetId of deletedAssetIds) {
       assetMetadataCache.delete(assetId);
       assetMetadataRequests.delete(assetId);
@@ -4022,30 +4239,46 @@ export function App() {
     }
 
     const editor = editorRef.current;
-    if (!editor || deletedAssetIds.size === 0) {
+    let removedCanvasCount = 0;
+    if (editor) {
+      const shapeIds = galleryImageShapeIdsFromSnapshot(editor.getSnapshot(), deletedAssetIds);
+      if (shapeIds.length > 0) {
+        editor.deleteShapes(shapeIds);
+        removedCanvasCount = shapeIds.length;
+      }
+    }
+
+    const snapshot = editor?.getSnapshot() ?? projectSnapshot;
+    if (!snapshot) {
+      return removedCanvasCount;
+    }
+
+    const cleaned = removeGalleryAssetsFromSnapshot(snapshot, deletedAssetIds);
+    if (cleaned.changed) {
+      setProjectSnapshot(cleaned.snapshot);
+      void persistProjectSnapshot(cleaned.snapshot);
+    }
+
+    if (editor || cleaned.changed) {
+      for (const assetId of deletedAssetIds) {
+        pendingGalleryDeletedAssetIdsRef.current.delete(assetId);
+      }
+    }
+
+    return removedCanvasCount + (editor ? 0 : cleaned.removedShapeCount);
+  }
+
+  function removeGalleryItemsFromCanvas(deletedItems: DeletedGalleryItem[]): number {
+    const deletedAssetIds = new Set(deletedItems.map((item) => item.assetId));
+    if (deletedAssetIds.size === 0) {
       return 0;
     }
 
-    const shapeIds: TLShapeId[] = [];
-    for (const shape of editor.getCurrentPageShapes()) {
-      if (shape.type !== "image") {
-        continue;
-      }
-
-      const imageShape = shape as TLImageShape;
-      const asset = imageShape.props.assetId ? editor.getAsset(imageShape.props.assetId) : undefined;
-      const sourceUrl = getImageSourceUrl(imageShape, asset);
-      const localAssetId = getLocalAssetId(asset, sourceUrl);
-      if (localAssetId && deletedAssetIds.has(localAssetId)) {
-        shapeIds.push(imageShape.id);
-      }
+    for (const assetId of deletedAssetIds) {
+      pendingGalleryDeletedAssetIdsRef.current.add(assetId);
     }
 
-    if (shapeIds.length > 0) {
-      editor.deleteShapes(shapeIds);
-    }
-
-    return shapeIds.length;
+    return cleanupGalleryDeletedAssets(deletedAssetIds);
   }
 
   function removeGalleryOutputFromHistory(deletedItems: DeletedGalleryItem[]): void {
