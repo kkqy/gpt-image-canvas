@@ -80,6 +80,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   const statusTimerRef = useRef<number | undefined>();
   const batchDownloadAbortRef = useRef<AbortController | null>(null);
   const batchDeleteAbortRef = useRef<AbortController | null>(null);
+  const selectionAnchorOutputIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -161,12 +162,13 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   }, []);
 
   useEffect(() => {
+    const existingOutputIds = new Set(items.map((item) => item.outputId));
+
     setSelectedOutputIds((current) => {
       if (current.size === 0) {
         return current;
       }
 
-      const existingOutputIds = new Set(items.map((item) => item.outputId));
       const next = new Set<string>();
       for (const outputId of current) {
         if (existingOutputIds.has(outputId)) {
@@ -176,6 +178,10 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
 
       return next.size === current.size ? current : next;
     });
+
+    if (selectionAnchorOutputIdRef.current && !existingOutputIds.has(selectionAnchorOutputIdRef.current)) {
+      selectionAnchorOutputIdRef.current = null;
+    }
   }, [items]);
 
   const filteredItems = useMemo(() => {
@@ -331,16 +337,29 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
     batchDownloadAbortRef.current?.abort();
   }
 
-  function toggleSelectedItem(item: GalleryImageItem): void {
+  function toggleSelectedItem(item: GalleryImageItem, shiftKey = false): void {
+    const currentIndex = filteredItems.findIndex((filteredItem) => filteredItem.outputId === item.outputId);
+    const anchorOutputId = selectionAnchorOutputIdRef.current;
+    const anchorIndex = anchorOutputId ? filteredItems.findIndex((filteredItem) => filteredItem.outputId === anchorOutputId) : -1;
+    const shouldSelectRange = shiftKey && currentIndex !== -1 && anchorIndex !== -1;
+
     setSelectedOutputIds((current) => {
       const next = new Set(current);
-      if (next.has(item.outputId)) {
+
+      if (shouldSelectRange) {
+        const startIndex = Math.min(anchorIndex, currentIndex);
+        const endIndex = Math.max(anchorIndex, currentIndex);
+        for (const rangeItem of filteredItems.slice(startIndex, endIndex + 1)) {
+          next.add(rangeItem.outputId);
+        }
+      } else if (next.has(item.outputId)) {
         next.delete(item.outputId);
       } else {
         next.add(item.outputId);
       }
       return next;
     });
+    selectionAnchorOutputIdRef.current = item.outputId;
   }
 
   function selectFilteredItems(): void {
@@ -355,6 +374,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
 
   function clearSelection(): void {
     setSelectedOutputIds(new Set());
+    selectionAnchorOutputIdRef.current = null;
   }
 
   function requestDelete(item: GalleryImageItem): void {
@@ -392,6 +412,9 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
         return next;
       });
       setSelectedItem((current) => (current?.outputId === item.outputId ? null : current));
+      if (selectionAnchorOutputIdRef.current === item.outputId) {
+        selectionAnchorOutputIdRef.current = null;
+      }
       setPendingDeleteItem(null);
       onDeleted([{ assetId: item.asset.id, outputId: item.outputId }]);
       showStatus(t("galleryDeleted"));
@@ -514,6 +537,9 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
       return next;
     });
     setSelectedItem((current) => (current && deletedSet.has(current.outputId) ? null : current));
+    if (selectionAnchorOutputIdRef.current && deletedSet.has(selectionAnchorOutputIdRef.current)) {
+      selectionAnchorOutputIdRef.current = null;
+    }
     onDeleted(deletedItems);
   }
 
@@ -806,7 +832,7 @@ function FeaturedGalleryItem({
   isSelected: boolean;
   item: GalleryImageItem;
   onOpen: (item: GalleryImageItem) => void;
-  onToggleSelected: (item: GalleryImageItem) => void;
+  onToggleSelected: (item: GalleryImageItem, shiftKey?: boolean) => void;
   onTogglePrompt: (outputId: string) => void;
 } & GalleryActionHandlers) {
   const { formatDateTime, t } = useI18n();
@@ -885,7 +911,7 @@ function GalleryCard({
   isSelected: boolean;
   item: GalleryImageItem;
   onOpen: (item: GalleryImageItem) => void;
-  onToggleSelected: (item: GalleryImageItem) => void;
+  onToggleSelected: (item: GalleryImageItem, shiftKey?: boolean) => void;
   onTogglePrompt: (outputId: string) => void;
 } & GalleryActionHandlers) {
   const { formatDateTime, t } = useI18n();
@@ -947,7 +973,7 @@ function GallerySelectButton({
 }: {
   isSelected: boolean;
   item: GalleryImageItem;
-  onToggleSelected: (item: GalleryImageItem) => void;
+  onToggleSelected: (item: GalleryImageItem, shiftKey?: boolean) => void;
 }) {
   const { t } = useI18n();
 
@@ -960,7 +986,7 @@ function GallerySelectButton({
       type="button"
       onClick={(event) => {
         event.stopPropagation();
-        onToggleSelected(item);
+        onToggleSelected(item, event.shiftKey);
       }}
     >
       {isSelected ? <Check className="size-4" aria-hidden="true" /> : null}
