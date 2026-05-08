@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS generation_records (
 CREATE TABLE IF NOT EXISTS generation_outputs (
   id TEXT PRIMARY KEY NOT NULL,
   generation_id TEXT NOT NULL REFERENCES generation_records(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL,
   asset_id TEXT REFERENCES assets(id),
   error TEXT,
@@ -185,6 +186,7 @@ ensureColumn("agent_llm_configs", "base_url", "base_url TEXT NOT NULL DEFAULT ''
 ensureColumn("agent_llm_configs", "model", "model TEXT NOT NULL DEFAULT ''");
 ensureColumn("agent_llm_configs", "timeout_ms", "timeout_ms INTEGER NOT NULL DEFAULT 60000");
 ensureColumn("agent_llm_configs", "supports_vision", "supports_vision INTEGER NOT NULL DEFAULT 0");
+ensureColumn("generation_outputs", "position", "position INTEGER NOT NULL DEFAULT 0");
 
 backfillGenerationReferenceAssets();
 ensureProviderConfigRow();

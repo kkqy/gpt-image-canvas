@@ -178,6 +178,7 @@ export interface GeneratedAssetCloudInfo {
 
 export interface GenerationOutput {
   id: string;
+  position?: number;
   status: OutputStatus;
   asset?: GeneratedAsset;
   error?: string;

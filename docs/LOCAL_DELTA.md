@@ -113,10 +113,16 @@ Manual text generation and reference generation use bounded parallel requests.
 - `OPENAI_IMAGE_BATCH_CONCURRENCY` controls how many single-output requests run at once.
 - Default concurrency is `2`.
 - This applies to text generation and reference image editing.
+- Completed outputs are persisted while the generation record is still `running`, using `generation_outputs.position` to preserve placeholder order.
+- Canvas polling should replace each completed output's placeholder incrementally; it must not wait for the whole batch to finish before showing any generated image.
+- Gallery may show completed outputs from a still-running generation; Canvas should stay in sync with those completed outputs on the next poll.
 
 Important paths:
 
 - `apps/api/src/domain/generation/image-generation.ts`
+- `apps/api/src/infrastructure/database.ts`
+- `apps/api/src/infrastructure/schema.ts`
+- `apps/web/src/features/canvas/CanvasApp.tsx`
 - `.env.example`
 - `README.md`
 - `README.zh-CN.md`

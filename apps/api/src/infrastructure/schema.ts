@@ -100,6 +100,7 @@ export const generationOutputs = sqliteTable("generation_outputs", {
   generationId: text("generation_id")
     .notNull()
     .references(() => generationRecords.id, { onDelete: "cascade" }),
+  position: integer("position").notNull().default(0),
   status: text("status").notNull(),
   assetId: text("asset_id").references(() => assets.id),
   error: text("error"),

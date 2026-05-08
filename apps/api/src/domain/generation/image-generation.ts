@@ -48,6 +48,7 @@ interface StoredAssetFile {
 
 interface BatchOutputResult {
   id: string;
+  position: number;
   status: "succeeded" | "failed";
   asset?: GeneratedAsset;
   cloudStorage?: AssetCloudStorageRecord;
@@ -137,7 +138,11 @@ export async function completeTextGenerationRecord(
   const outputs = await mapWithConcurrency(
     Array.from({ length: input.count }, (_, index) => index),
     getBatchConcurrency(),
-    async () => generateSingleOutput(input, provider, signal)
+    async (position) => {
+      const output = await generateSingleOutput(input, provider, signal, position);
+      persistGenerationOutput(generationId, output);
+      return output;
+    }
   );
 
   return completeGenerationRecord(generationId, { ...input, mode: "generate" }, outputs);
@@ -152,7 +157,11 @@ export async function completeReferenceGenerationRecord(
   const outputs = await mapWithConcurrency(
     Array.from({ length: input.count }, (_, index) => index),
     getBatchConcurrency(),
-    async () => editSingleOutput(input, provider, signal)
+    async (position) => {
+      const output = await editSingleOutput(input, provider, signal, position);
+      persistGenerationOutput(generationId, output);
+      return output;
+    }
   );
 
   return completeGenerationRecord(generationId, { ...input, mode: "edit" }, outputs);
@@ -348,7 +357,12 @@ export async function readStoredAssetMetadata(assetId: string): Promise<AssetMet
   };
 }
 
-async function generateSingleOutput(input: ImageProviderInput, provider: ImageProvider, signal?: AbortSignal): Promise<BatchOutputResult> {
+async function generateSingleOutput(
+  input: ImageProviderInput,
+  provider: ImageProvider,
+  signal: AbortSignal | undefined,
+  position: number
+): Promise<BatchOutputResult> {
   const outputId = randomUUID();
 
   try {
@@ -371,6 +385,7 @@ async function generateSingleOutput(input: ImageProviderInput, provider: ImagePr
 
     return {
       id: outputId,
+      position,
       status: "succeeded",
       asset: saved.asset,
       cloudStorage: saved.cloudStorage
@@ -382,13 +397,19 @@ async function generateSingleOutput(input: ImageProviderInput, provider: ImagePr
 
     return {
       id: outputId,
+      position,
       status: "failed",
       error: errorToMessage(error)
     };
   }
 }
 
-async function editSingleOutput(input: EditImageProviderInput, provider: ImageProvider, signal?: AbortSignal): Promise<BatchOutputResult> {
+async function editSingleOutput(
+  input: EditImageProviderInput,
+  provider: ImageProvider,
+  signal: AbortSignal | undefined,
+  position: number
+): Promise<BatchOutputResult> {
   const outputId = randomUUID();
 
   try {
@@ -411,6 +432,7 @@ async function editSingleOutput(input: EditImageProviderInput, provider: ImagePr
 
     return {
       id: outputId,
+      position,
       status: "succeeded",
       asset: saved.asset,
       cloudStorage: saved.cloudStorage
@@ -422,6 +444,7 @@ async function editSingleOutput(input: EditImageProviderInput, provider: ImagePr
 
     return {
       id: outputId,
+      position,
       status: "failed",
       error: errorToMessage(error)
     };
@@ -548,42 +571,6 @@ function completeGenerationRecord(generationId: string, input: PersistedGenerati
     .where(eq(generationRecords.id, generationId))
     .run();
 
-  for (const output of outputs) {
-    if (output.asset) {
-      db.insert(assets)
-        .values({
-          id: output.asset.id,
-          fileName: output.asset.fileName,
-          relativePath: `assets/${output.asset.fileName}`,
-          mimeType: output.asset.mimeType,
-          width: output.asset.width,
-          height: output.asset.height,
-          cloudProvider: output.cloudStorage?.provider ?? null,
-          cloudBucket: output.cloudStorage?.bucket ?? null,
-          cloudRegion: output.cloudStorage?.region ?? null,
-          cloudObjectKey: output.cloudStorage?.objectKey ?? null,
-          cloudStatus: output.cloudStorage?.status ?? null,
-          cloudError: output.cloudStorage?.error ?? null,
-          cloudUploadedAt: output.cloudStorage?.uploadedAt ?? null,
-          cloudEtag: output.cloudStorage?.etag ?? null,
-          cloudRequestId: output.cloudStorage?.requestId ?? null,
-          createdAt: new Date().toISOString()
-        })
-        .run();
-    }
-
-    db.insert(generationOutputs)
-      .values({
-        id: output.id,
-        generationId,
-        status: output.status,
-        assetId: output.asset?.id ?? null,
-        error: output.error ?? null,
-        createdAt: new Date().toISOString()
-      })
-      .run();
-  }
-
   return generationRecordFromInput(generationId, input, {
     createdAt,
     error,
@@ -637,10 +624,51 @@ function resolveGenerationStatus(successCount: number, failureCount: number): Ge
 function toGenerationOutput(output: BatchOutputResult): GenerationOutput {
   return {
     id: output.id,
+    position: output.position,
     status: output.status,
     asset: output.asset,
     error: output.error
   };
+}
+
+function persistGenerationOutput(generationId: string, output: BatchOutputResult): void {
+  const createdAt = new Date().toISOString();
+  if (output.asset) {
+    db.insert(assets)
+      .values({
+        id: output.asset.id,
+        fileName: output.asset.fileName,
+        relativePath: `assets/${output.asset.fileName}`,
+        mimeType: output.asset.mimeType,
+        width: output.asset.width,
+        height: output.asset.height,
+        cloudProvider: output.cloudStorage?.provider ?? null,
+        cloudBucket: output.cloudStorage?.bucket ?? null,
+        cloudRegion: output.cloudStorage?.region ?? null,
+        cloudObjectKey: output.cloudStorage?.objectKey ?? null,
+        cloudStatus: output.cloudStorage?.status ?? null,
+        cloudError: output.cloudStorage?.error ?? null,
+        cloudUploadedAt: output.cloudStorage?.uploadedAt ?? null,
+        cloudEtag: output.cloudStorage?.etag ?? null,
+        cloudRequestId: output.cloudStorage?.requestId ?? null,
+        createdAt
+      })
+      .onConflictDoNothing()
+      .run();
+  }
+
+  db.insert(generationOutputs)
+    .values({
+      id: output.id,
+      generationId,
+      position: output.position,
+      status: output.status,
+      assetId: output.asset?.id ?? null,
+      error: output.error ?? null,
+      createdAt
+    })
+    .onConflictDoNothing()
+    .run();
 }
 
 async function saveAssetToConfiguredCloud(input: {

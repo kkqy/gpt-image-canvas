@@ -1,4 +1,4 @@
-import { desc, eq, inArray } from "drizzle-orm";
+import { asc, desc, eq, inArray } from "drizzle-orm";
 import { isAbsolute, relative, resolve } from "node:path";
 import { deleteStoredAssetPreviews } from "../assets/preview.js";
 import type {
@@ -290,7 +290,7 @@ function mapGenerationRecordRows(records: Array<typeof generationRecords.$inferS
     .select()
     .from(generationOutputs)
     .where(inArray(generationOutputs.generationId, generationIds))
-    .orderBy(generationOutputs.createdAt)
+    .orderBy(asc(generationOutputs.generationId), asc(generationOutputs.position), asc(generationOutputs.createdAt))
     .all();
   const referenceRows = db
     .select()
@@ -324,6 +324,7 @@ function mapGenerationRecordRows(records: Array<typeof generationRecords.$inferS
   return records.flatMap((record) => {
     const mappedOutputs = (outputsByGenerationId.get(record.id) ?? []).map((output) => ({
       id: output.id,
+      position: output.position,
       status: output.status as OutputStatus,
       asset: output.assetId ? toGeneratedAsset(assetById.get(output.assetId)) : undefined,
       error: output.error ?? undefined

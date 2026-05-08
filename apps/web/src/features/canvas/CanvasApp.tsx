@@ -95,6 +95,7 @@ import {
   type GalleryImageItem,
   type GenerationCount,
   type GenerationJob,
+  type GenerationOutput,
   type GenerationPlan,
   type GenerationRecord,
   type GenerationReference,
@@ -397,6 +398,9 @@ interface ActiveGenerationTask {
   temporaryRecordId: string;
   controller: AbortController;
   placeholderSet: ActiveGenerationPlaceholders;
+  appliedOutputIds: Set<string>;
+  failedCount: number;
+  insertedCount: number;
   serverGenerationId?: string;
 }
 
@@ -1285,6 +1289,117 @@ function replaceGenerationPlaceholders(editor: Editor, placeholderSet: ActiveGen
   }
 
   return imageShapes.length;
+}
+
+function generationOutputPosition(output: GenerationOutput, fallbackIndex: number): number {
+  return Number.isInteger(output.position) && output.position !== undefined && output.position >= 0 ? output.position : fallbackIndex;
+}
+
+function applyGenerationOutputsToPlaceholders(
+  editor: Editor,
+  placeholderSet: ActiveGenerationPlaceholders,
+  record: GenerationRecord,
+  appliedOutputIds: Set<string>,
+  t: Translate,
+  options: { final?: boolean } = {}
+): { failedCount: number; insertedCount: number } {
+  const assets: TLAsset[] = [];
+  const imageShapes: Array<Partial<TLImageShape> & { id: TLShapeId; type: "image" }> = [];
+  const replacedPlaceholderIds: TLShapeId[] = [];
+  const failedUpdates: Array<TLShapePartial<GenerationPlaceholderShape>> = [];
+  const resolvedOutputPositions = new Set<number>();
+  const newlyAppliedOutputIds: string[] = [];
+
+  record.outputs.forEach((output, fallbackIndex) => {
+    const position = generationOutputPosition(output, fallbackIndex);
+    resolvedOutputPositions.add(position);
+    if (appliedOutputIds.has(output.id)) {
+      return;
+    }
+
+    const placement = placeholderSet.placements[position];
+    if (!placement) {
+      newlyAppliedOutputIds.push(output.id);
+      return;
+    }
+
+    const placeholder = editor.getShape(placement.id);
+    if (!isGenerationPlaceholderShape(placeholder)) {
+      newlyAppliedOutputIds.push(output.id);
+      return;
+    }
+
+    if (output.status === "succeeded" && output.asset) {
+      const resolvedPlacement = livePlacement(editor, placement);
+      assets.push(createImageAsset(output.asset));
+      imageShapes.push(createImageShape(output.asset, resolvedPlacement, record.prompt));
+      replacedPlaceholderIds.push(placement.id);
+      newlyAppliedOutputIds.push(output.id);
+      return;
+    }
+
+    if (output.status === "failed") {
+      failedUpdates.push({
+        id: placement.id,
+        type: GENERATION_PLACEHOLDER_TYPE,
+        props: {
+          status: "failed",
+          error: output.error || record.error || t("generationErrorDefault")
+        }
+      });
+      newlyAppliedOutputIds.push(output.id);
+    }
+  });
+
+  if (options.final) {
+    placeholderSet.placements.forEach((placement, position) => {
+      if (resolvedOutputPositions.has(position)) {
+        return;
+      }
+
+      const placeholder = editor.getShape(placement.id);
+      if (!isGenerationPlaceholderShape(placeholder) || placeholder.props.status !== "loading") {
+        return;
+      }
+
+      failedUpdates.push({
+        id: placement.id,
+        type: GENERATION_PLACEHOLDER_TYPE,
+        props: {
+          status: "failed",
+          error: record.error || t("generationErrorDefault")
+        }
+      });
+    });
+  }
+
+  editor.run(() => {
+    if (replacedPlaceholderIds.length > 0) {
+      editor.deleteShapes(replacedPlaceholderIds);
+    }
+    if (assets.length > 0) {
+      editor.createAssets(assets);
+    }
+    if (imageShapes.length > 0) {
+      editor.createShapes(imageShapes);
+    }
+    if (failedUpdates.length > 0) {
+      editor.updateShapes<GenerationPlaceholderShape>(failedUpdates);
+    }
+  });
+
+  for (const outputId of newlyAppliedOutputIds) {
+    appliedOutputIds.add(outputId);
+  }
+
+  if (imageShapes.length > 0) {
+    editor.select(...imageShapes.map((shape) => shape.id));
+  }
+
+  return {
+    failedCount: failedUpdates.length,
+    insertedCount: imageShapes.length
+  };
 }
 
 function generatedAssetsForRecord(record: GenerationRecord): GeneratedAsset[] {
@@ -3733,6 +3848,10 @@ export function App() {
         [body.record, ...history.filter((record) => record.id !== task.temporaryRecordId && record.id !== body.record.id)].slice(0, 20)
       );
 
+      if (isPendingGenerationRecord(body.record) && body.record.outputs.length > 0) {
+        await applyGenerationRecordProgress(requestId, body.record);
+      }
+
       if (!isPendingGenerationRecord(body.record)) {
         return body.record;
       }
@@ -3743,6 +3862,31 @@ export function App() {
     if (activeGenerationsRef.current.delete(requestId)) {
       setActiveGenerationCount(activeGenerationsRef.current.size);
     }
+  }
+
+  async function applyGenerationRecordProgress(
+    requestId: number,
+    record: GenerationRecord,
+    options: { final?: boolean } = {}
+  ): Promise<{ failedCount: number; insertedCount: number }> {
+    const task = activeGenerationsRef.current.get(requestId);
+    const editor = editorRef.current;
+    if (!task || !editor) {
+      return { failedCount: 0, insertedCount: 0 };
+    }
+
+    const newAssets = record.outputs.flatMap((output) =>
+      !task.appliedOutputIds.has(output.id) && output.status === "succeeded" && output.asset ? [output.asset] : []
+    );
+    await Promise.all(newAssets.map((asset) => preloadGeneratedAssetPreview(asset, task.controller.signal)));
+    if (task.controller.signal.aborted || !activeGenerationsRef.current.has(requestId)) {
+      return { failedCount: 0, insertedCount: 0 };
+    }
+
+    const result = applyGenerationOutputsToPlaceholders(editor, task.placeholderSet, record, task.appliedOutputIds, t, options);
+    task.failedCount += result.failedCount;
+    task.insertedCount += result.insertedCount;
+    return result;
   }
 
   async function applyCompletedGenerationRecord(requestId: number, record: GenerationRecord): Promise<void> {
@@ -3774,18 +3918,12 @@ export function App() {
       return;
     }
 
-    await preloadGenerationRecordPreviews(record, task.controller.signal);
-    if (task.controller.signal.aborted || !activeGenerationsRef.current.has(requestId)) {
-      return;
-    }
-
     setGenerationHistory((history) =>
       [record, ...history.filter((item) => item.id !== task.temporaryRecordId && item.id !== record.id)].slice(0, 20)
     );
-    const insertedCount = replaceGenerationPlaceholders(editor, task.placeholderSet, record, t);
-    const failedCount =
-      record.outputs.filter((output) => output.status === "failed").length +
-      Math.max(0, task.placeholderSet.placements.length - record.outputs.length);
+    await applyGenerationRecordProgress(requestId, record, { final: true });
+    const insertedCount = task.insertedCount;
+    const failedCount = task.failedCount;
     const cloudFailedCount = cloudFailureCount(record);
     if (insertedCount > 0) {
       if (cloudFailedCount > 0 || failedCount > 0) {
@@ -3865,6 +4003,9 @@ export function App() {
         requestId,
         temporaryRecordId: record.id,
         controller: new AbortController(),
+        appliedOutputIds: new Set(),
+        failedCount: 0,
+        insertedCount: 0,
         placeholderSet,
         serverGenerationId: record.id
       });
@@ -3921,6 +4062,9 @@ export function App() {
       requestId,
       temporaryRecordId: temporaryRecord.id,
       controller,
+      appliedOutputIds: new Set(),
+      failedCount: 0,
+      insertedCount: 0,
       placeholderSet,
       serverGenerationId
     });
